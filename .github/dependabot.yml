@@ -1,35 +1,11 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
-
 version: 2
 updates:
-  - package-ecosystem: "maven"
-    directory: "/jvm-packages"
-    schedule:
-      interval: "monthly"
-  - package-ecosystem: "maven"
-    directory: "/jvm-packages/xgboost4j"
-    schedule:
-      interval: "daily"
-  - package-ecosystem: "maven"
-    directory: "/jvm-packages/xgboost4j-gpu"
-    schedule:
-      interval: "monthly"
-  - package-ecosystem: "maven"
-    directory: "/jvm-packages/xgboost4j-example"
-    schedule:
-      interval: "monthly"
-  - package-ecosystem: "maven"
-    directory: "/jvm-packages/xgboost4j-spark"
+  - package-ecosystem: "pip"
+    directory: "/"
+    insecure-external-code-execution: allow
+    pull-request-branch-name:
+      # Separate sections of the branch name with a hyphen
+      # for example, `dependabot-npm_and_yarn-next_js-acorn-6.4.1`
+      separator: "-"
     schedule:
       interval: "daily"
-  - package-ecosystem: "maven"
-    directory: "/jvm-packages/xgboost4j-spark-gpu"
-    schedule:
-      interval: "monthly"
-  - package-ecosystem: "github-actions"
-    directory: /
-    schedule:
-      interval: "monthly"

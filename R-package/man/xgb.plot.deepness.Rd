@@ -18,13 +18,14 @@ xgb.plot.deepness(
 )
 }
 \arguments{
-\item{model}{Either an \code{xgb.Booster} model, or the "data.table" returned by \code{\link[=xgb.model.dt.tree]{xgb.model.dt.tree()}}.}
+\item{model}{Either an \code{xgb.Booster} model, or the "data.table" returned
+by \code{\link[=xgb.model.dt.tree]{xgb.model.dt.tree()}}.}
 
 \item{which}{Which distribution to plot (see details).}
 
 \item{plot}{Should the plot be shown? Default is \code{TRUE}.}
 
-\item{...}{Other parameters passed to \code{\link[graphics:barplot]{graphics::barplot()}} or \code{\link[graphics:plot.default]{graphics::plot()}}.}
+\item{...}{Other parameters passed to \code{\link[graphics:barplot]{graphics::barplot()}} or \code{\link[graphics:plot]{graphics::plot()}}.}
 }
 \value{
 The return value of the two functions is as follows:
@@ -73,26 +74,24 @@ nthread <- 2
 data.table::setDTthreads(nthread)
 
 ## Change max_depth to a higher number to get a more significant result
-bst <- xgboost(
-  data = agaricus.train$data,
-  label = agaricus.train$label,
-  max_depth = 6,
-  nthread = nthread,
+model <- xgboost(
+  agaricus.train$data, factor(agaricus.train$label),
   nrounds = 50,
-  objective = "binary:logistic",
+  max_depth = 6,
+  nthreads = nthread,
   subsample = 0.5,
   min_child_weight = 2
 )
 
-xgb.plot.deepness(bst)
-xgb.ggplot.deepness(bst)
+xgb.plot.deepness(model)
+xgb.ggplot.deepness(model)
 
 xgb.plot.deepness(
-  bst, which = "max.depth", pch = 16, col = rgb(0, 0, 1, 0.3), cex = 2
+  model, which = "max.depth", pch = 16, col = rgb(0, 0, 1, 0.3), cex = 2
 )
 
 xgb.plot.deepness(
-  bst, which = "med.weight", pch = 16, col = rgb(0, 0, 1, 0.3), cex = 2
+  model, which = "med.weight", pch = 16, col = rgb(0, 0, 1, 0.3), cex = 2
 )
 
 }

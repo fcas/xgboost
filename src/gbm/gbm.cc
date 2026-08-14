@@ -1,5 +1,5 @@
-/*!
- * Copyright 2015-2022 by XGBoost Contributors
+/**
+ * Copyright 2015-2025, XGBoost Contributors
  * \file gbm.cc
  * \brief Registry of gradient boosters.
  */
@@ -7,9 +7,7 @@
 
 #include <dmlc/registry.h>
 
-#include <memory>
 #include <string>
-#include <vector>
 
 #include "xgboost/context.h"
 #include "xgboost/learner.h"
@@ -20,12 +18,13 @@ DMLC_REGISTRY_ENABLE(::xgboost::GradientBoosterReg);
 
 namespace xgboost {
 GradientBooster* GradientBooster::Create(const std::string& name, Context const* ctx,
-                                         LearnerModelParam const* learner_model_param) {
-  auto *e = ::dmlc::Registry< ::xgboost::GradientBoosterReg>::Get()->Find(name);
+                                         LearnerModelState const* learner_model_state) {
+  auto const& gbm_name = name == "dart" ? std::string{"gbtree"} : name;
+  auto* e = ::dmlc::Registry<::xgboost::GradientBoosterReg>::Get()->Find(gbm_name);
   if (e == nullptr) {
     LOG(FATAL) << "Unknown gbm type " << name;
   }
-  auto p_bst =  (e->body)(learner_model_param, ctx);
+  auto p_bst = (e->body)(learner_model_state, ctx);
   return p_bst;
 }
 }  // namespace xgboost

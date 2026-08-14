@@ -1,5 +1,5 @@
 /**
- * Copyright 2016-2024, XGBoost contributors
+ * Copyright 2016-2025, XGBoost contributors
  */
 #pragma once
 
@@ -10,7 +10,7 @@
 #include <xgboost/base.h>
 #include <xgboost/context.h>
 #include <xgboost/json.h>
-#include <xgboost/learner.h>  // for LearnerModelParam
+#include <xgboost/learner.h>  // for LearnerModelState
 #include <xgboost/model.h>    // for Configurable
 
 #include <cstdint>  // std::int32_t
@@ -19,29 +19,28 @@
 #include <string>
 #include <vector>
 
-#include "../../src/collective/communicator-inl.h"
-#include "../../src/common/common.h"
-#include "../../src/common/threading_utils.h"
-#include "filesystem.h"  // dmlc::TemporaryDirectory
+#if defined(__CUDACC__)
+#include "../../src/collective/communicator-inl.h"  // for GetRank
+#include "../../src/common/cuda_rt_utils.h"         // for AllVisibleGPUs
+#endif                                              // defined(__CUDACC__)
+
+#include "filesystem.h"  // for TemporaryDirectory
 #include "xgboost/linalg.h"
-#if !defined(_OPENMP)
-#include <thread>
-#endif
 
 #if defined(__CUDACC__)
-#define DeclareUnifiedTest(name) GPU ## name
+#define DeclareUnifiedTest(name) GPU##name
 #else
 #define DeclareUnifiedTest(name) name
 #endif
 
 #if defined(__CUDACC__)
-#define GPUIDX (common::AllVisibleGPUs() == 1 ? 0 : collective::GetRank())
+#define GPUIDX (curt::AllVisibleGPUs() == 1 ? 0 : collective::GetRank())
 #else
 #define GPUIDX (-1)
 #endif
 
 #if defined(__CUDACC__)
-#define DeclareUnifiedDistributedTest(name) MGPU ## name
+#define DeclareUnifiedDistributedTest(name) MGPU##name
 #else
 #define DeclareUnifiedDistributedTest(name) name
 #endif
@@ -49,14 +48,26 @@
 namespace xgboost {
 class ObjFunction;
 class Metric;
-struct LearnerModelParam;
+struct LearnerModelState;
 class GradientBooster;
-}
+}  // namespace xgboost
 
 template <typename Float>
 Float RelError(Float l, Float r) {
-  static_assert(std::is_floating_point<Float>::value);
+  static_assert(std::is_floating_point_v<Float>);
   return std::abs(1.0f - l / r);
+}
+
+template <typename T, typename V = std::remove_cv_t<T>>
+void AssertVecEq(std::vector<T> h_vec, std::vector<V> const& exp, float atol = 1e-5) {
+  ASSERT_EQ(h_vec.size(), exp.size());
+  for (std::size_t i = 0; i < h_vec.size(); ++i) {
+    if constexpr (std::is_floating_point_v<V>) {
+      ASSERT_NEAR(h_vec[i], exp[i], atol) << "i:" << i;
+    } else {
+      ASSERT_EQ(h_vec[i], exp[i]);
+    }
+  }
 }
 
 bool FileExists(const std::string& filename);
@@ -70,20 +81,16 @@ void CreateBigTestData(const std::string& filename, size_t n_entries, bool zero_
 void CreateTestCSV(std::string const& path, size_t rows, size_t cols);
 
 void CheckObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
-                      std::vector<xgboost::bst_float> preds,
-                      std::vector<xgboost::bst_float> labels,
+                      std::vector<xgboost::bst_float> preds, std::vector<xgboost::bst_float> labels,
                       std::vector<xgboost::bst_float> weights,
                       std::vector<xgboost::bst_float> out_grad,
                       std::vector<xgboost::bst_float> out_hess);
 
-xgboost::Json CheckConfigReloadImpl(xgboost::Configurable* const configurable,
-                                    std::string name);
+xgboost::Json CheckConfigReloadImpl(xgboost::Configurable* const configurable, std::string name);
 
 template <typename T>
-xgboost::Json CheckConfigReload(std::unique_ptr<T> const& configurable,
-                                std::string name = "") {
-  return CheckConfigReloadImpl(dynamic_cast<xgboost::Configurable*>(configurable.get()),
-                               name);
+xgboost::Json CheckConfigReload(std::unique_ptr<T> const& configurable, std::string name = "") {
+  return CheckConfigReloadImpl(dynamic_cast<xgboost::Configurable*>(configurable.get()), name);
 }
 
 void CheckRankingObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
@@ -95,23 +102,19 @@ void CheckRankingObjFunction(std::unique_ptr<xgboost::ObjFunction> const& obj,
                              std::vector<xgboost::bst_float> out_hess);
 
 xgboost::bst_float GetMetricEval(
-  xgboost::Metric * metric,
-  xgboost::HostDeviceVector<xgboost::bst_float> const& preds,
-  std::vector<xgboost::bst_float> labels,
-  std::vector<xgboost::bst_float> weights = std::vector<xgboost::bst_float>(),
-  std::vector<xgboost::bst_uint> groups = std::vector<xgboost::bst_uint>(),
-  xgboost::DataSplitMode data_split_Mode = xgboost::DataSplitMode::kRow);
+    xgboost::Metric* metric, xgboost::HostDeviceVector<xgboost::bst_float> const& preds,
+    std::vector<xgboost::bst_float> labels,
+    std::vector<xgboost::bst_float> weights = std::vector<xgboost::bst_float>(),
+    std::vector<xgboost::bst_uint> groups = std::vector<xgboost::bst_uint>());
 
 double GetMultiMetricEval(xgboost::Metric* metric,
                           xgboost::HostDeviceVector<xgboost::bst_float> const& preds,
                           xgboost::linalg::Tensor<float, 2> const& labels,
                           std::vector<xgboost::bst_float> weights = {},
-                          std::vector<xgboost::bst_uint> groups = {},
-                          xgboost::DataSplitMode data_split_Mode = xgboost::DataSplitMode::kRow);
+                          std::vector<xgboost::bst_uint> groups = {});
 
 namespace xgboost {
-
-float GetBaseScore(Json const &config);
+[[nodiscard]] std::vector<float> GetBaseScore(Json const& config);
 
 /*!
  * \brief Linear congruential generator.
@@ -167,10 +170,9 @@ class SimpleRealUniformDistribution {
   /*! \brief Over-simplified version of std::generate_canonical. */
   template <size_t Bits, typename GeneratorT>
   ResultT GenerateCanonical(GeneratorT* rng) const {
-    static_assert(std::is_floating_point<ResultT>::value,
-                  "Result type must be floating point.");
-    long double const r = (static_cast<long double>(rng->Max())
-                           - static_cast<long double>(rng->Min())) + 1.0L;
+    static_assert(std::is_floating_point_v<ResultT>, "Result type must be floating point.");
+    long double const r =
+        (static_cast<long double>(rng->Max()) - static_cast<long double>(rng->Min())) + 1.0L;
     auto const log2r = static_cast<size_t>(std::log(r) / std::log(2.0L));
     size_t m = std::max<size_t>(1UL, (Bits + log2r - 1UL) / log2r);
     ResultT sum_value = 0, r_k = 1;
@@ -185,13 +187,11 @@ class SimpleRealUniformDistribution {
   }
 
  public:
-  SimpleRealUniformDistribution(ResultT l, ResultT u) :
-      lower_{l}, upper_{u} {}
+  SimpleRealUniformDistribution(ResultT l, ResultT u) : lower_{l}, upper_{u} {}
 
   template <typename GeneratorT>
   ResultT operator()(GeneratorT* rng) const {
-    ResultT tmp = GenerateCanonical<std::numeric_limits<ResultT>::digits,
-                                    GeneratorT>(rng);
+    ResultT tmp = GenerateCanonical<std::numeric_limits<ResultT>::digits, GeneratorT>(rng);
     auto ret = (tmp * (upper_ - lower_)) + lower_;
     // Correct floating point error.
     return std::max(ret, lower_);
@@ -215,7 +215,7 @@ Json GetArrayInterface(HostDeviceVector<T> const* storage, size_t rows, size_t c
   array_interface["shape"][1] = cols;
 
   char t = linalg::detail::ArrayInterfaceHandler::TypeChar<T>();
-  array_interface["typestr"] = String(std::string{"<"} + t + std::to_string(sizeof(T)));
+  array_interface["typestr"] = String(std::string("<") + t + std::to_string(sizeof(T)));
   array_interface["version"] = 3;
   return array_interface;
 }
@@ -230,6 +230,7 @@ class RandomDataGenerator {
   float upper_{1.0f};
 
   bst_target_t n_targets_{1};
+  bst_target_t n_classes_{0};
 
   DeviceOrd device_{DeviceOrd::CPU()};
   std::size_t n_batches_{0};
@@ -239,14 +240,18 @@ class RandomDataGenerator {
   bst_bin_t bins_{0};
   std::vector<FeatureType> ft_;
   bst_cat_t max_cat_{32};
+  bool on_host_{false};
+  std::shared_ptr<DMatrix> ref_{nullptr};
+  std::int64_t min_cache_page_bytes_{0};
+  float cache_host_ratio_;
+  float hw_decomp_ratio_{true};
 
   Json ArrayInterfaceImpl(HostDeviceVector<float>* storage, size_t rows, size_t cols) const;
 
   void GenerateLabels(std::shared_ptr<DMatrix> p_fmat) const;
 
  public:
-  RandomDataGenerator(bst_idx_t rows, size_t cols, float sparsity)
-      : rows_{rows}, cols_{cols}, sparsity_{sparsity}, lcg_{seed_} {}
+  RandomDataGenerator(bst_idx_t rows, std::size_t cols, float sparsity);
 
   RandomDataGenerator& Lower(float v) {
     lower_ = v;
@@ -262,6 +267,26 @@ class RandomDataGenerator {
   }
   RandomDataGenerator& Batches(std::size_t n_batches) {
     n_batches_ = n_batches;
+    return *this;
+  }
+  RandomDataGenerator& OnHost(bool on_host) {
+    on_host_ = on_host;
+    return *this;
+  }
+  RandomDataGenerator& Ref(std::shared_ptr<DMatrix> ref) {
+    this->ref_ = std::move(ref);
+    return *this;
+  }
+  RandomDataGenerator& MinPageCacheBytes(std::int64_t min_cache_page_bytes) {
+    this->min_cache_page_bytes_ = min_cache_page_bytes;
+    return *this;
+  }
+  [[nodiscard]] RandomDataGenerator& CacheHostRatio(float cache_host_ratio) {
+    this->cache_host_ratio_ = cache_host_ratio;
+    return *this;
+  }
+  [[nodiscard]] RandomDataGenerator& HwDecompRatio(float hw_decomp_ratio) {
+    this->hw_decomp_ratio_ = hw_decomp_ratio;
     return *this;
   }
   RandomDataGenerator& Seed(uint64_t s) {
@@ -287,6 +312,10 @@ class RandomDataGenerator {
     n_targets_ = n_targets;
     return *this;
   }
+  RandomDataGenerator& Classes(bst_target_t n_classes) {
+    n_classes_ = n_classes;
+    return *this;
+  }
 
   void GenerateDense(HostDeviceVector<float>* out) const;
 
@@ -310,16 +339,14 @@ class RandomDataGenerator {
   void GenerateCSR(HostDeviceVector<float>* value, HostDeviceVector<std::size_t>* row_ptr,
                    HostDeviceVector<bst_feature_t>* columns) const;
 
-  [[nodiscard]] std::shared_ptr<DMatrix> GenerateDMatrix(
-      bool with_label = false, bool float_label = true, size_t classes = 1,
-      DataSplitMode data_split_mode = DataSplitMode::kRow) const;
+  [[nodiscard]] std::shared_ptr<DMatrix> GenerateDMatrix(bool with_label = false) const;
 
   [[nodiscard]] std::shared_ptr<DMatrix> GenerateSparsePageDMatrix(std::string prefix,
                                                                    bool with_label) const;
 
-#if defined(XGBOOST_USE_CUDA)
-  std::shared_ptr<DMatrix> GenerateDeviceDMatrix(bool with_label);
-#endif
+  [[nodiscard]] std::shared_ptr<DMatrix> GenerateExtMemQuantileDMatrix(std::string prefix,
+                                                                       bool with_label) const;
+
   std::shared_ptr<DMatrix> GenerateQuantileDMatrix(bool with_label);
 };
 
@@ -328,63 +355,19 @@ inline std::shared_ptr<DMatrix> EmptyDMatrix() {
   return RandomDataGenerator{0, 0, 0.0}.GenerateDMatrix();
 }
 
-inline std::vector<float> GenerateRandomCategoricalSingleColumn(int n, size_t num_categories) {
-  std::vector<float> x(n);
-  std::mt19937 rng(0);
-  std::uniform_int_distribution<size_t> dist(0, num_categories - 1);
-  std::generate(x.begin(), x.end(), [&]() { return static_cast<float>(dist(rng)); });
-  // Make sure each category is present
-  for (size_t i = 0; i < num_categories; i++) {
-    x[i] = static_cast<decltype(x)::value_type>(i);
-  }
-  return x;
-}
+[[nodiscard]] std::vector<float> GenerateRandomCategoricalSingleColumn(std::size_t n,
+                                                                       std::size_t n_categories);
 
 std::shared_ptr<DMatrix> GetDMatrixFromData(const std::vector<float>& x, std::size_t num_rows,
                                             bst_feature_t num_columns);
 
-/**
- * \brief Create Sparse Page using data iterator.
- *
- * \param n_samples  Total number of rows for all batches combined.
- * \param n_features Number of features
- * \param n_batches  Number of batches
- * \param prefix     Cache prefix, can be used for specifying file path.
- *
- * \return A Sparse DMatrix with n_batches.
- */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrix(bst_idx_t n_samples, bst_feature_t n_features,
-                                                 size_t n_batches, std::string prefix = "cache");
-
-/**
- * Deprecated, stop using it
- */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrix(size_t n_entries, std::string prefix = "cache");
-
-/**
- * Deprecated, stop using it
- *
- * \brief Creates dmatrix with some records, each record containing random number of
- *        features in [1, n_cols]
- *
- * \param n_rows      Number of records to create.
- * \param n_cols      Max number of features within that record.
- * \param page_size   Sparse page size for the pages within the dmatrix. If page size is 0
- *                    then the entire dmatrix is resident in memory; else, multiple sparse pages
- *                    of page size are created and backed to disk, which would have to be
- *                    streamed in at point of use.
- * \param deterministic The content inside the dmatrix is constant for this configuration, if true;
- *                      else, the content changes every time this method is invoked
- *
- * \return The new dmatrix.
- */
-std::unique_ptr<DMatrix> CreateSparsePageDMatrixWithRC(
-    size_t n_rows, size_t n_cols, size_t page_size, bool deterministic,
-    const dmlc::TemporaryDirectory& tempdir = dmlc::TemporaryDirectory());
+[[nodiscard]] std::shared_ptr<DMatrix> GetExternalMemoryDMatrixFromData(
+    HostDeviceVector<float> const& x, bst_idx_t n_samples, bst_feature_t n_features,
+    const common::TemporaryDirectory& tempdir, bst_idx_t n_batches = 4);
 
 std::unique_ptr<GradientBooster> CreateTrainedGBM(std::string name, Args kwargs, size_t kRows,
                                                   size_t kCols,
-                                                  LearnerModelParam const* learner_model_param,
+                                                  LearnerModelState const* learner_model_state,
                                                   Context const* generic_param);
 
 /**
@@ -412,17 +395,17 @@ inline HostDeviceVector<GradientPair> GenerateRandomGradients(const size_t n_row
   return gpair;
 }
 
-inline linalg::Matrix<GradientPair> GenerateRandomGradients(Context const* ctx, bst_idx_t n_rows,
-                                                            bst_target_t n_targets,
-                                                            float lower = 0.0f,
-                                                            float upper = 1.0f) {
+inline auto GenerateRandomGradients(Context const* ctx, bst_idx_t n_rows, bst_target_t n_targets,
+                                    float lower = 0.0f, float upper = 1.0f) {
   auto g = GenerateRandomGradients(n_rows * n_targets, lower, upper);
-  linalg::Matrix<GradientPair> gpair({n_rows, static_cast<bst_idx_t>(n_targets)}, ctx->Device());
-  gpair.Data()->Copy(g);
+  GradientContainer gpair;
+  gpair.gpair =
+      linalg::Matrix<GradientPair>{{n_rows, static_cast<bst_idx_t>(n_targets)}, ctx->Device()};
+  gpair.gpair.Data()->Copy(g);
   return gpair;
 }
 
-typedef void *DMatrixHandle;  // NOLINT(*);
+typedef void* DMatrixHandle;  // NOLINT(*);
 
 class ArrayIterForTest {
  protected:
@@ -463,6 +446,10 @@ class CudaArrayIterForTest : public ArrayIterForTest {
  public:
   explicit CudaArrayIterForTest(float sparsity, size_t rows = Rows(), size_t cols = Cols(),
                                 size_t batches = Batches());
+  explicit CudaArrayIterForTest(Context const* ctx, HostDeviceVector<float> const& data,
+                                std::size_t n_samples, bst_feature_t n_features,
+                                std::size_t n_batches)
+      : ArrayIterForTest{ctx, data, n_samples, n_features, n_batches} {};
   int Next() override;
   ~CudaArrayIterForTest() override = default;
 };
@@ -479,19 +466,14 @@ class NumpyArrayIterForTest : public ArrayIterForTest {
   ~NumpyArrayIterForTest() override = default;
 };
 
-void DMatrixToCSR(DMatrix *dmat, std::vector<float> *p_data,
-                  std::vector<size_t> *p_row_ptr,
-                  std::vector<bst_feature_t> *p_cids);
+void DMatrixToCSR(DMatrix* dmat, std::vector<float>* p_data, std::vector<size_t>* p_row_ptr,
+                  std::vector<bst_feature_t>* p_cids);
 
-typedef void *DataIterHandle;  // NOLINT(*)
+typedef void* DataIterHandle;  // NOLINT(*)
 
-inline void Reset(DataIterHandle self) {
-  static_cast<ArrayIterForTest*>(self)->Reset();
-}
+inline void Reset(DataIterHandle self) { static_cast<ArrayIterForTest*>(self)->Reset(); }
 
-inline int Next(DataIterHandle self) {
-  return static_cast<ArrayIterForTest*>(self)->Next();
-}
+inline int Next(DataIterHandle self) { return static_cast<ArrayIterForTest*>(self)->Next(); }
 
 /**
  * @brief Create an array interface for host vector.
@@ -504,84 +486,26 @@ char const* Make1dInterfaceTest(T const* vec, std::size_t len) {
 }
 
 class RMMAllocator;
-using RMMAllocatorPtr = std::unique_ptr<RMMAllocator, void(*)(RMMAllocator*)>;
+using RMMAllocatorPtr = std::unique_ptr<RMMAllocator, void (*)(RMMAllocator*)>;
 RMMAllocatorPtr SetUpRMMResourceForCppTests(int argc, char** argv);
 
 /*
  * \brief Make learner model param
  */
-inline LearnerModelParam MakeMP(bst_feature_t n_features, float base_score, uint32_t n_groups,
+inline LearnerModelState MakeMP(bst_feature_t n_features, float base_score, uint32_t n_groups,
                                 DeviceOrd device = DeviceOrd::CPU()) {
   size_t shape[1]{1};
-  LearnerModelParam mparam(n_features, linalg::Tensor<float, 1>{{base_score}, shape, device},
+  LearnerModelState mparam(n_features, linalg::Tensor<float, 1>{{base_score}, shape, device},
                            n_groups, 1, MultiStrategy::kOneOutputPerTree);
   return mparam;
 }
 
 inline std::int32_t AllThreadsForTest() { return Context{}.Threads(); }
 
-template <bool use_nccl = false, typename Function, typename... Args>
-void RunWithInMemoryCommunicator(int32_t world_size, Function&& function, Args&&... args) {
-  auto run = [&](auto rank) {
-    Json config{JsonObject()};
-    if constexpr (use_nccl) {
-      config["xgboost_communicator"] = String("in-memory-nccl");
-    } else {
-      config["xgboost_communicator"] = String("in-memory");
-    }
-    config["in_memory_world_size"] = world_size;
-    config["in_memory_rank"] = rank;
-    xgboost::collective::Init(config);
-
-    std::forward<Function>(function)(std::forward<Args>(args)...);
-
-    xgboost::collective::Finalize();
-  };
-#if defined(_OPENMP)
-  common::ParallelFor(world_size, world_size, run);
-#else
-  std::vector<std::thread> threads;
-  for (auto rank = 0; rank < world_size; rank++) {
-    threads.emplace_back(run, rank);
-  }
-  for (auto& thread : threads) {
-    thread.join();
-  }
-#endif
-}
-
-class BaseMGPUTest : public ::testing::Test {
- protected:
-  int world_size_;
-  bool use_nccl_{false};
-
-  void SetUp() override {
-    auto const n_gpus = common::AllVisibleGPUs();
-    if (n_gpus <= 1) {
-      // Use a single GPU to simulate distributed environment.
-      world_size_ = 3;
-      // NCCL doesn't like sharing a single GPU, so we use the adapter instead.
-      use_nccl_ = false;
-    } else {
-      // Use multiple GPUs for real.
-      world_size_ = n_gpus;
-      use_nccl_ = true;
-    }
-  }
-
-  template <typename Function, typename... Args>
-  void DoTest(Function&& function, Args&&... args) {
-    if (use_nccl_) {
-      RunWithInMemoryCommunicator<true>(world_size_, function, args...);
-    } else {
-      RunWithInMemoryCommunicator<false>(world_size_, function, args...);
-    }
-  }
-};
-
-class DeclareUnifiedDistributedTest(MetricTest) : public BaseMGPUTest{};
-
 inline DeviceOrd FstCU() { return DeviceOrd::CUDA(0); }
+
+// GPU device ordinal for distributed tests
+std::int32_t DistGpuIdx();
 
 inline auto GMockThrow(StringView msg) {
   return ::testing::ThrowsMessage<dmlc::Error>(::testing::HasSubstr(msg));

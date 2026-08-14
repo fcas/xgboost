@@ -1,18 +1,17 @@
 import csv
 import os
-import tempfile
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
 import scipy.sparse
+import xgboost as xgb
 from hypothesis import given, settings, strategies
 from scipy.sparse import csr_matrix, rand
-
-import xgboost as xgb
 from xgboost import testing as tm
-from xgboost.core import DataSplitMode
-from xgboost.testing.data import np_dtypes, run_base_margin_info
+from xgboost.testing.data import IteratorForTest, np_dtypes, run_base_margin_info
+from xgboost.testing.utils import predictor_equal
 
 dpath = "demo/data/"
 rng = np.random.RandomState(1994)
@@ -63,6 +62,19 @@ class TestDMatrix:
         with pytest.raises(ValueError):
             xgb.DMatrix(data)
 
+    def test_dmatrix_numpy_non_native_byte_order(self):
+        data = np.arange(1, 7, dtype=np.float32).reshape(2, 3)
+        labels = np.arange(1, 3, dtype=np.float32)
+        swapped_data = data.astype(data.dtype.newbyteorder("S"))
+        swapped_labels = labels.astype(labels.dtype.newbyteorder("S"))
+        assert not swapped_data.dtype.isnative
+        assert not swapped_labels.dtype.isnative
+
+        dmat = xgb.DMatrix(swapped_data, label=swapped_labels)
+
+        np.testing.assert_array_equal(dmat.get_data().toarray(), data)
+        np.testing.assert_array_equal(dmat.get_label(), labels)
+
     def test_np_view(self):
         # Sliced Float32 array
         y = np.array([12, 34, 56], np.float32)[::2]
@@ -81,6 +93,20 @@ class TestDMatrix:
         from_array = dmat.get_uint_info("group_ptr")
         assert from_view.shape == from_array.shape
         assert (from_view == from_array).all()
+
+    @pytest.mark.skipif(
+        np.dtype(np.longdouble).itemsize != 16,
+        reason="128-bit NumPy floating point is not supported on this platform",
+    )
+    def test_np_float128_view(self):
+        base = np.arange(1, 401, dtype=np.longdouble).reshape(100, 4)
+        view = base[:2, ::2]
+        assert view.strides == (4 * view.itemsize, 2 * view.itemsize)
+
+        dmat = xgb.DMatrix(view)
+        np.testing.assert_array_equal(
+            dmat.get_data().toarray(), view.astype(np.float32)
+        )
 
     def test_slice(self):
         X = rng.randn(100, 100)
@@ -102,10 +128,7 @@ class TestDMatrix:
         # Slicing works with label and other meta info fields
         np.testing.assert_equal(sliced.get_label(), y[1:7])
         np.testing.assert_equal(sliced.get_float_info("feature_weights"), fw)
-        np.testing.assert_equal(sliced.get_base_margin(), base_margin[1:7, :].flatten())
-        np.testing.assert_equal(
-            sliced.get_base_margin(), sliced.get_float_info("base_margin")
-        )
+        np.testing.assert_equal(sliced.get_base_margin(), base_margin[1:7, :])
 
         # Slicing a DMatrix results into a DMatrix that's equivalent to a DMatrix that's
         # constructed from the corresponding NumPy slice
@@ -198,18 +221,17 @@ class TestDMatrix:
                 bst.predict(dm)
 
     @pytest.mark.skipif(**tm.no_pandas())
-    def test_save_binary(self):
+    def test_save_binary(self, tmp_path: Path) -> None:
         import pandas as pd
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "m.dmatrix")
-            data = pd.DataFrame({"a": [0, 1], "b": [2, 3], "c": [4, 5]})
-            m0 = xgb.DMatrix(data.loc[:, ["a", "b"]], data["c"])
-            assert m0.feature_names == ["a", "b"]
-            m0.save_binary(path)
-            m1 = xgb.DMatrix(path)
-            assert m0.feature_names == m1.feature_names
-            assert m0.feature_types == m1.feature_types
+        path = tmp_path / "m.dmatrix"
+        data = pd.DataFrame({"a": [0, 1], "b": [2, 3], "c": [4, 5]})
+        m0 = xgb.DMatrix(data.loc[:, ["a", "b"]], data["c"])
+        assert m0.feature_names == ["a", "b"]
+        m0.save_binary(path)
+        m1 = xgb.DMatrix(path)
+        assert m0.feature_names == m1.feature_names
+        assert m0.feature_types == m1.feature_types
 
     def test_get_info(self):
         dtrain, _ = tm.load_agaricus(__file__)
@@ -254,7 +276,7 @@ class TestDMatrix:
         with pytest.raises(ValueError):
             m.set_info(feature_weights=fw)
 
-    def test_sparse_dmatrix_csr(self):
+    def test_sparse_dmatrix_csr(self, tmp_path: Path) -> None:
         nrow = 100
         ncol = 1000
         x = rand(nrow, ncol, density=0.0005, format="csr", random_state=rng)
@@ -274,23 +296,23 @@ class TestDMatrix:
         di32 = xgb.DMatrix(i32)
         df32 = xgb.DMatrix(f32)
         dense = xgb.DMatrix(f32.toarray(), missing=0)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "f32.dmatrix")
-            df32.save_binary(path)
-            with open(path, "rb") as fd:
-                df32_buffer = np.array(fd.read())
-            path = os.path.join(tmpdir, "f32.dmatrix")
-            di32.save_binary(path)
-            with open(path, "rb") as fd:
-                di32_buffer = np.array(fd.read())
 
-            path = os.path.join(tmpdir, "dense.dmatrix")
-            dense.save_binary(path)
-            with open(path, "rb") as fd:
-                dense_buffer = np.array(fd.read())
+        path = tmp_path / "f32.dmatrix"
+        df32.save_binary(path)
+        with open(path, "rb") as fd:
+            df32_buffer = np.array(fd.read())
+        path = tmp_path / "i32.dmatrix"
+        di32.save_binary(path)
+        with open(path, "rb") as fd:
+            di32_buffer = np.array(fd.read())
 
-            np.testing.assert_equal(df32_buffer, di32_buffer)
-            np.testing.assert_equal(df32_buffer, dense_buffer)
+        path = tmp_path / "dense.dmatrix"
+        dense.save_binary(path)
+        with open(path, "rb") as fd:
+            dense_buffer = np.array(fd.read())
+
+        np.testing.assert_equal(df32_buffer, di32_buffer)
+        np.testing.assert_equal(df32_buffer, dense_buffer)
 
     def test_sparse_dmatrix_csc(self):
         nrow = 1000
@@ -397,126 +419,33 @@ class TestDMatrix:
         for orig, x in np_dtypes(n_samples, n_features):
             m0 = xgb.DMatrix(orig)
             m1 = xgb.DMatrix(x)
-            assert tm.predictor_equal(m0, m1)
+            assert predictor_equal(m0, m1)
 
 
-@pytest.mark.skipif(tm.is_windows(), reason="Rabit does not run on windows")
-class TestDMatrixColumnSplit:
-    def test_numpy(self):
-        def verify_numpy():
-            data = np.random.randn(5, 5)
-            dm = xgb.DMatrix(data, data_split_mode=DataSplitMode.COL)
-            assert dm.num_row() == 5
-            assert dm.num_col() == 5 * xgb.collective.get_world_size()
-            assert dm.feature_names is None
-            assert dm.feature_types is None
+class TestDMatrixColumnSplitRemoved:
+    def test_numpy(self) -> None:
+        data = np.random.randn(5, 5)
+        with pytest.raises(ValueError, match="Column-wise data split has been removed"):
+            xgb.DMatrix(data, data_split_mode=1)
 
-        tm.run_with_rabit(world_size=3, test_fn=verify_numpy)
+    def test_uri(self, tmp_path: Path) -> None:
+        filename = tmp_path / "test_data.csv"
+        data = np.random.rand(5, 5)
+        with open(filename, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(data)
 
-    def test_numpy_feature_names(self):
-        def verify_numpy_feature_names():
-            world_size = xgb.collective.get_world_size()
-            data = np.random.randn(5, 5)
-            feature_names = [f"feature{x}" for x in range(5)]
-            feature_types = ["float"] * 5
-            dm = xgb.DMatrix(
-                data,
-                feature_names=feature_names,
-                feature_types=feature_types,
-                data_split_mode=DataSplitMode.COL,
-            )
-            assert dm.num_row() == 5
-            assert dm.num_col() == 5 * world_size
-            assert len(dm.feature_names) == 5 * world_size
-            assert dm.feature_names == tm.column_split_feature_names(
-                feature_names, world_size
-            )
-            assert len(dm.feature_types) == 5 * world_size
-            assert dm.feature_types == ["float"] * 5 * world_size
+        with pytest.raises(ValueError, match="Column-wise data split has been removed"):
+            xgb.DMatrix(f"{filename}?format=csv", data_split_mode=1)
 
-        tm.run_with_rabit(world_size=3, test_fn=verify_numpy_feature_names)
+    def test_quantile_dmatrix(self) -> None:
+        data = np.random.randn(5, 5)
+        with pytest.raises(ValueError, match="Column-wise data split has been removed"):
+            xgb.QuantileDMatrix(data, data_split_mode=1)
 
-    def test_csr(self):
-        def verify_csr():
-            indptr = np.array([0, 2, 3, 6])
-            indices = np.array([0, 2, 2, 0, 1, 2])
-            data = np.array([1, 2, 3, 4, 5, 6])
-            X = scipy.sparse.csr_matrix((data, indices, indptr), shape=(3, 3))
-            dtrain = xgb.DMatrix(X, data_split_mode=DataSplitMode.COL)
-            assert dtrain.num_row() == 3
-            assert dtrain.num_col() == 3 * xgb.collective.get_world_size()
-
-        tm.run_with_rabit(world_size=3, test_fn=verify_csr)
-
-    def test_csc(self):
-        def verify_csc():
-            row = np.array([0, 2, 2, 0, 1, 2])
-            col = np.array([0, 0, 1, 2, 2, 2])
-            data = np.array([1, 2, 3, 4, 5, 6])
-            X = scipy.sparse.csc_matrix((data, (row, col)), shape=(3, 3))
-            dtrain = xgb.DMatrix(X, data_split_mode=DataSplitMode.COL)
-            assert dtrain.num_row() == 3
-            assert dtrain.num_col() == 3 * xgb.collective.get_world_size()
-
-        tm.run_with_rabit(world_size=3, test_fn=verify_csc)
-
-    def test_coo(self):
-        def verify_coo():
-            row = np.array([0, 2, 2, 0, 1, 2])
-            col = np.array([0, 0, 1, 2, 2, 2])
-            data = np.array([1, 2, 3, 4, 5, 6])
-            X = scipy.sparse.coo_matrix((data, (row, col)), shape=(3, 3))
-            dtrain = xgb.DMatrix(X, data_split_mode=DataSplitMode.COL)
-            assert dtrain.num_row() == 3
-            assert dtrain.num_col() == 3 * xgb.collective.get_world_size()
-
-        tm.run_with_rabit(world_size=3, test_fn=verify_coo)
-
-    def test_uri(self):
-        def verify_uri():
-            rank = xgb.collective.get_rank()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                filename = os.path.join(tmpdir, f"test_data_{rank}.csv")
-
-                data = np.random.rand(5, 5)
-                with open(filename, mode="w", newline="") as file:
-                    writer = csv.writer(file)
-                    for row in data:
-                        writer.writerow(row)
-                dtrain = xgb.DMatrix(
-                    f"{filename}?format=csv", data_split_mode=DataSplitMode.COL
-                )
-                assert dtrain.num_row() == 5
-                assert dtrain.num_col() == 5 * xgb.collective.get_world_size()
-
-        tm.run_with_rabit(world_size=3, test_fn=verify_uri)
-
-    def test_list(self):
-        def verify_list():
-            data = [
-                [1, 2, 3, 4, 5],
-                [6, 7, 8, 9, 10],
-                [11, 12, 13, 14, 15],
-                [16, 17, 18, 19, 20],
-                [21, 22, 23, 24, 25],
-            ]
-            dm = xgb.DMatrix(data, data_split_mode=DataSplitMode.COL)
-            assert dm.num_row() == 5
-            assert dm.num_col() == 5 * xgb.collective.get_world_size()
-
-        tm.run_with_rabit(world_size=3, test_fn=verify_list)
-
-    def test_tuple(self):
-        def verify_tuple():
-            data = (
-                (1, 2, 3, 4, 5),
-                (6, 7, 8, 9, 10),
-                (11, 12, 13, 14, 15),
-                (16, 17, 18, 19, 20),
-                (21, 22, 23, 24, 25),
-            )
-            dm = xgb.DMatrix(data, data_split_mode=DataSplitMode.COL)
-            assert dm.num_row() == 5
-            assert dm.num_col() == 5 * xgb.collective.get_world_size()
-
-        tm.run_with_rabit(world_size=3, test_fn=verify_tuple)
+    def test_iterator(self) -> None:
+        X = [np.random.randn(5, 5)]
+        y = [np.random.randn(5)]
+        it = IteratorForTest(X, y, None, cache=None)
+        with pytest.raises(ValueError, match="Column-wise data split has been removed"):
+            xgb.DMatrix(it, data_split_mode=1)

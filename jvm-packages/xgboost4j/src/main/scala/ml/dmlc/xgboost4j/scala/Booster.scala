@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014-2022 by Contributors
+ Copyright (c) 2014-2024 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -16,12 +16,14 @@
 
 package ml.dmlc.xgboost4j.scala
 
-import com.esotericsoftware.kryo.io.{Output, Input}
-import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
-import ml.dmlc.xgboost4j.java.{Booster => JBooster}
-import ml.dmlc.xgboost4j.java.XGBoostError
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+
+import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
+import com.esotericsoftware.kryo.io.{Input, Output}
+
+import ml.dmlc.xgboost4j.java.{Booster => JBooster}
+import ml.dmlc.xgboost4j.java.XGBoostError
 
 /**
   * Booster for xgboost, this is a model API that support interactive build of a XGBoost Model
@@ -177,39 +179,39 @@ class Booster private[xgboost4j](private[xgboost4j] var booster: JBooster)
    *
    * @param data         dmatrix storing the input
    * @param outPutMargin Whether to output the raw untransformed margin value.
-   * @param treeLimit    Limit number of trees in the prediction; defaults to 0 (use all trees).
+   * @param iterationEnd End of the boosting iteration range; 0 uses all iterations.
    * @return predict result
    */
   @throws(classOf[XGBoostError])
-  def predict(data: DMatrix, outPutMargin: Boolean = false, treeLimit: Int = 0):
+  def predict(data: DMatrix, outPutMargin: Boolean = false, iterationEnd: Int = 0):
       Array[Array[Float]] = {
-    booster.predict(data.jDMatrix, outPutMargin, treeLimit)
+    booster.predict(data.jDMatrix, outPutMargin, iterationEnd)
   }
 
   /**
    * Predict the leaf indices
    *
-   * @param data      dmatrix storing the input
-   * @param treeLimit Limit number of trees in the prediction; defaults to 0 (use all trees).
+   * @param data         dmatrix storing the input
+   * @param iterationEnd End of the boosting iteration range; 0 uses all iterations.
    * @return predict result
    * @throws XGBoostError native error
    */
   @throws(classOf[XGBoostError])
-  def predictLeaf(data: DMatrix, treeLimit: Int = 0): Array[Array[Float]] = {
-    booster.predictLeaf(data.jDMatrix, treeLimit)
+  def predictLeaf(data: DMatrix, iterationEnd: Int = 0): Array[Array[Float]] = {
+    booster.predictLeaf(data.jDMatrix, iterationEnd)
   }
 
   /**
     * Output feature contributions toward predictions of given data
     *
-    * @param data      dmatrix storing the input
-    * @param treeLimit Limit number of trees in the prediction; defaults to 0 (use all trees).
+    * @param data         dmatrix storing the input
+    * @param iterationEnd End of the boosting iteration range; 0 uses all iterations.
     * @return The feature contributions and bias.
     * @throws XGBoostError native error
     */
   @throws(classOf[XGBoostError])
-  def predictContrib(data: DMatrix, treeLimit: Int = 0) : Array[Array[Float]] = {
-    booster.predictContrib(data.jDMatrix, treeLimit)
+  def predictContrib(data: DMatrix, iterationEnd: Int = 0) : Array[Array[Float]] = {
+    booster.predictContrib(data.jDMatrix, iterationEnd)
   }
 
   /**
@@ -363,4 +365,8 @@ class Booster private[xgboost4j](private[xgboost4j] var booster: JBooster)
   override def read(kryo: Kryo, input: Input): Unit = {
     booster = kryo.readObject(input, classOf[JBooster])
   }
+
+  // a flag to indicate if the device is set for the GPU transform
+  var deviceIsSet = false
+
 }

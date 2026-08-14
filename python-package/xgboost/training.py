@@ -1,10 +1,22 @@
-# pylint: disable=too-many-locals, too-many-arguments, invalid-name
+# pylint: disable=too-many-locals, too-many-arguments
 # pylint: disable=too-many-branches, too-many-statements
 """Training Library containing training routines."""
+
 import copy
 import os
-import warnings
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union, cast
+import weakref
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import numpy as np
 
@@ -15,37 +27,26 @@ from .callback import (
     EvaluationMonitor,
     TrainingCallback,
 )
-from .compat import SKLEARN_INSTALLED, DataFrame, XGBStratifiedKFold
+from .compat import SKLEARN_INSTALLED, XGBStratifiedKFold
 from .core import (
     Booster,
+    CustomObj,
     DMatrix,
     Metric,
-    Objective,
     XGBoostError,
     _deprecate_positional_args,
+    _RefMixIn,
 )
+
+if TYPE_CHECKING:
+    from pandas import DataFrame as PdDataFrame
 
 _CVFolds = Sequence["CVPack"]
 
-
-def _configure_custom_metric(
-    feval: Optional[Metric], custom_metric: Optional[Metric]
-) -> Optional[Metric]:
-    if feval is not None:
-        link = (
-            "https://xgboost.readthedocs.io/en/latest/tutorials/custom_metric_obj.html"
-        )
-        warnings.warn(
-            "`feval` is deprecated, use `custom_metric` instead.  They have "
-            "different behavior when custom objective is also used."
-            f"See {link} for details on the `custom_metric`."
-        )
-    if feval is not None and custom_metric is not None:
-        raise ValueError(
-            "Both `feval` and `custom_metric` are supplied.  Use `custom_metric` instead."
-        )
-    eval_metric = custom_metric if custom_metric is not None else feval
-    return eval_metric
+_RefError = (
+    "Training dataset should be used as a reference when constructing the "
+    "`QuantileDMatrix` for evaluation.",
+)
 
 
 @_deprecate_positional_args
@@ -55,8 +56,7 @@ def train(
     num_boost_round: int = 10,
     *,
     evals: Optional[Sequence[Tuple[DMatrix, str]]] = None,
-    obj: Optional[Objective] = None,
-    feval: Optional[Metric] = None,
+    obj: Optional[CustomObj] = None,
     maximize: Optional[bool] = None,
     early_stopping_rounds: Optional[int] = None,
     evals_result: Optional[TrainingCallback.EvalsLog] = None,
@@ -81,23 +81,27 @@ def train(
     obj
         Custom objective function.  See :doc:`Custom Objective
         </tutorials/custom_metric_obj>` for details.
-    feval :
-        .. deprecated:: 1.6.0
-            Use `custom_metric` instead.
     maximize :
-        Whether to maximize feval.
+        Whether to maximize custom_metric.
+
     early_stopping_rounds :
+
         Activates early stopping. Validation metric needs to improve at least once in
         every **early_stopping_rounds** round(s) to continue training.
+
         Requires at least one item in **evals**.
+
         The method returns the model from the last iteration (not the best one).  Use
-        custom callback or model slicing if the best model is desired.
-        If there's more than one item in **evals**, the last entry will be used for early
-        stopping.
+        custom callback :py:class:`~xgboost.callback.EarlyStopping` or :py:meth:`model
+        slicing <xgboost.Booster.__getitem__>` if the best model is desired.  If there's
+        more than one item in **evals**, the last entry will be used for early stopping.
+
         If there's more than one metric in the **eval_metric** parameter given in
         **params**, the last metric will be used for early stopping.
+
         If early stopping occurs, the model will have two additional fields:
         ``bst.best_score``, ``bst.best_iteration``.
+
     evals_result :
         This dictionary stores the evaluation results of all the items in watchlist.
 
@@ -113,15 +117,22 @@ def train(
 
     verbose_eval :
         Requires at least one item in **evals**.
+
         If **verbose_eval** is True then the evaluation metric on the validation set is
         printed at each boosting stage.
-        If **verbose_eval** is an integer then the evaluation metric on the validation set
-        is printed at every given **verbose_eval** boosting stage. The last boosting stage
-        / the boosting stage found by using **early_stopping_rounds** is also printed.
-        Example: with ``verbose_eval=4`` and at least one item in **evals**, an evaluation metric
-        is printed every 4 boosting stages, instead of every boosting stage.
+
+        If **verbose_eval** is an integer then the evaluation metric on the validation
+        set is printed at every given **verbose_eval** boosting stage. The last boosting
+        stage / the boosting stage found by using **early_stopping_rounds** is also
+        printed.
+
+        Example: with ``verbose_eval=4`` and at least one item in **evals**, an
+        evaluation metric is printed every 4 boosting stages, instead of every boosting
+        stage.
+
     xgb_model :
         Xgb model to be loaded before training (allows training continuation).
+
     callbacks :
         List of callback functions that are applied at end of each iteration.
         It is possible to use predefined callbacks by using
@@ -145,16 +156,29 @@ def train(
         .. versionadded 1.6.0
 
         Custom metric function.  See :doc:`Custom Metric </tutorials/custom_metric_obj>`
-        for details.
+        for details. The metric receives transformed prediction (after applying the
+        reverse link function) when using a builtin objective, and raw output when using
+        a custom objective.
 
     Returns
     -------
     Booster : a trained booster model
+
     """
 
     callbacks = [] if callbacks is None else copy.copy(list(callbacks))
-    metric_fn = _configure_custom_metric(feval, custom_metric)
     evals = list(evals) if evals else []
+
+    for va, _ in evals:
+        if not isinstance(va, DMatrix):
+            raise TypeError("Invalid type for the `evals`.")
+
+        if (
+            isinstance(va, _RefMixIn)
+            and va.ref is not weakref.ref(dtrain)
+            and va is not dtrain
+        ):
+            raise ValueError(_RefError)
 
     bst = Booster(params, [dtrain] + [d[0] for d in evals], model_file=xgb_model)
     start_iteration = 0
@@ -165,12 +189,7 @@ def train(
     if early_stopping_rounds:
         callbacks.append(EarlyStopping(rounds=early_stopping_rounds, maximize=maximize))
     cb_container = CallbackContainer(
-        callbacks,
-        metric=metric_fn,
-        # For old `feval` parameter, the behavior is unchanged.  For the new
-        # `custom_metric`, it will receive proper prediction result when custom objective
-        # is not used.
-        output_margin=callable(obj) or metric_fn is feval,
+        callbacks, metric=custom_metric, output_margin=callable(obj)
     )
 
     bst = cb_container.before_training(bst)
@@ -187,9 +206,7 @@ def train(
     if evals_result is not None:
         evals_result.update(cb_container.history)
 
-    # Copy to serialise and unserialise booster to reset state and free
-    # training memory
-    return bst.copy()
+    return bst.reset()
 
 
 class CVPack:
@@ -198,7 +215,7 @@ class CVPack:
     def __init__(
         self, dtrain: DMatrix, dtest: DMatrix, param: Optional[Union[Dict, List]]
     ) -> None:
-        """ "Initialize the CVPack"""
+        """Initialize the CVPack."""
         self.dtrain = dtrain
         self.dtest = dtest
         self.watchlist = [(dtrain, "train"), (dtest, "test")]
@@ -210,7 +227,7 @@ class CVPack:
 
         return _inner
 
-    def update(self, iteration: int, fobj: Optional[Objective]) -> None:
+    def update(self, iteration: int, fobj: Optional[CustomObj]) -> None:
         """ "Update the boosters for one iteration"""
         self.bst.update(self.dtrain, iteration, fobj)
 
@@ -223,7 +240,7 @@ class _PackedBooster:
     def __init__(self, cvfolds: _CVFolds) -> None:
         self.cvfolds = cvfolds
 
-    def update(self, iteration: int, obj: Optional[Objective]) -> None:
+    def update(self, iteration: int, obj: Optional[CustomObj]) -> None:
         """Iterate through folds for update"""
         for fold in self.cvfolds:
             fold.update(iteration, obj)
@@ -264,7 +281,7 @@ class _PackedBooster:
 
     @best_iteration.setter
     def best_iteration(self, iteration: int) -> None:
-        """Get best_iteration"""
+        """Set best_iteration"""
         self.set_attr(best_iteration=iteration)
 
     @property
@@ -277,7 +294,7 @@ class _PackedBooster:
         self.set_attr(best_score=score)
 
 
-def groups_to_rows(groups: List[np.ndarray], boundaries: np.ndarray) -> np.ndarray:
+def groups_to_rows(groups: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
     """
     Given group row boundaries, convert ground indexes to row indexes
     :param groups: list of groups for testing
@@ -288,6 +305,7 @@ def groups_to_rows(groups: List[np.ndarray], boundaries: np.ndarray) -> np.ndarr
 
 
 def mkgroupfold(
+    *,
     dall: DMatrix,
     nfold: int,
     param: BoosterParam,
@@ -341,6 +359,7 @@ def mkgroupfold(
 
 
 def mknfold(
+    *,
     dall: DMatrix,
     nfold: int,
     param: BoosterParam,
@@ -361,7 +380,12 @@ def mknfold(
         # Do standard k-fold cross validation. Automatically determine the folds.
         if len(dall.get_uint_info("group_ptr")) > 1:
             return mkgroupfold(
-                dall, nfold, param, evals=evals, fpreproc=fpreproc, shuffle=shuffle
+                dall=dall,
+                nfold=nfold,
+                param=param,
+                evals=evals,
+                fpreproc=fpreproc,
+                shuffle=shuffle,
             )
 
         if shuffle is True:
@@ -407,16 +431,17 @@ def mknfold(
     return ret
 
 
+@_deprecate_positional_args
 def cv(
     params: BoosterParam,
     dtrain: DMatrix,
     num_boost_round: int = 10,
+    *,
     nfold: int = 3,
     stratified: bool = False,
-    folds: XGBStratifiedKFold = None,
+    folds: Optional[XGBStratifiedKFold] = None,
     metrics: Sequence[str] = (),
-    obj: Optional[Objective] = None,
-    feval: Optional[Metric] = None,
+    obj: Optional[CustomObj] = None,
     maximize: Optional[bool] = None,
     early_stopping_rounds: Optional[int] = None,
     fpreproc: Optional[FPreProcCallable] = None,
@@ -427,17 +452,17 @@ def cv(
     callbacks: Optional[Sequence[TrainingCallback]] = None,
     shuffle: bool = True,
     custom_metric: Optional[Metric] = None,
-) -> Union[Dict[str, float], DataFrame]:
-    # pylint: disable = invalid-name
+) -> Union[Dict[str, List[float]], "PdDataFrame"]:
     """Cross-validation with given parameters.
 
     Parameters
     ----------
     params : dict
         Booster params.
-    dtrain : DMatrix
-        Data to be trained.
-    num_boost_round : int
+    dtrain :
+        Data to be trained. Only the :py:class:`DMatrix` without external memory is
+        supported.
+    num_boost_round :
         Number of boosting iterations.
     nfold : int
         Number of folds in CV.
@@ -457,11 +482,9 @@ def cv(
         Custom objective function.  See :doc:`Custom Objective
         </tutorials/custom_metric_obj>` for details.
 
-    feval : function
-        .. deprecated:: 1.6.0
-            Use `custom_metric` instead.
     maximize : bool
-        Whether to maximize feval.
+        Whether to maximize the evaluataion metric (score or error).
+
     early_stopping_rounds: int
         Activates early stopping. Cross-Validation metric (average of validation
         metric computed over CV folds) needs to improve at least once in
@@ -474,7 +497,7 @@ def cv(
         transformed versions of those.
     as_pandas : bool, default True
         Return pd.DataFrame when pandas is installed.
-        If False or pandas is not installed, return np.ndarray
+        If False or pandas is not installed, returns a dictionary.
     verbose_eval : bool, int, or None, default None
         Whether to display the progress. If None, progress will be displayed
         when np.ndarray is returned. If True, progress will be displayed at
@@ -520,9 +543,10 @@ def cv(
         raise XGBoostError(
             "sklearn needs to be installed in order to use stratified cv"
         )
-
     if isinstance(metrics, str):
         metrics = [metrics]
+    if isinstance(dtrain, _RefMixIn):
+        raise ValueError("`QuantileDMatrix` is not yet supported.")
 
     params = params.copy()
     if isinstance(params, list):
@@ -541,10 +565,16 @@ def cv(
 
     results: Dict[str, List[float]] = {}
     cvfolds = mknfold(
-        dtrain, nfold, params, seed, metrics, fpreproc, stratified, folds, shuffle
+        dall=dtrain,
+        nfold=nfold,
+        param=params,
+        seed=seed,
+        evals=metrics,
+        fpreproc=fpreproc,
+        stratified=stratified,
+        folds=folds,
+        shuffle=shuffle,
     )
-
-    metric_fn = _configure_custom_metric(feval, custom_metric)
 
     # setup callbacks
     callbacks = [] if callbacks is None else copy.copy(list(callbacks))
@@ -555,10 +585,7 @@ def cv(
     if early_stopping_rounds:
         callbacks.append(EarlyStopping(rounds=early_stopping_rounds, maximize=maximize))
     callbacks_container = CallbackContainer(
-        callbacks,
-        metric=metric_fn,
-        is_cv=True,
-        output_margin=callable(obj) or metric_fn is feval,
+        callbacks, metric=custom_metric, is_cv=True, output_margin=callable(obj)
     )
 
     booster = _PackedBooster(cvfolds)
@@ -583,14 +610,16 @@ def cv(
             for k in results.keys():  # pylint: disable=consider-iterating-dictionary
                 results[k] = results[k][: (booster.best_iteration + 1)]
             break
+
+    results_df: Union[Dict[str, List[float]], "PdDataFrame"] = results
     if as_pandas:
         try:
             import pandas as pd
-
-            results = pd.DataFrame.from_dict(results)
         except ImportError:
             pass
+        else:
+            results_df = pd.DataFrame.from_dict(results)
 
     callbacks_container.after_training(booster)
 
-    return results
+    return results_df

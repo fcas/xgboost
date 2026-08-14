@@ -7,9 +7,9 @@
 #define XGBOOST_C_API_C_API_ERROR_H_
 
 #include <dmlc/base.h>
-#include <dmlc/logging.h>
 
-#include "c_api_utils.h"
+#include "c_api_utils.h"  // for XGBoostAPIGuard
+#include "xgboost/logging.h"
 
 /*! \brief  macro to guard beginning and end section of all functions */
 #ifdef LOG_CAPI_INVOCATION
@@ -17,7 +17,12 @@
   LOG(CONSOLE) << "[XGBoost C API invocation] " << __PRETTY_FUNCTION__;        \
   try {                                                                        \
     auto __guard = ::xgboost::XGBoostAPIGuard();
+
+#define API_BEGIN_UNGUARD()                                             \
+  LOG(CONSOLE) << "[XGBoost C API invocation] " << __PRETTY_FUNCTION__; \
+  try {
 #else  // LOG_CAPI_INVOCATION
+
 #define API_BEGIN()                                                            \
   try {                                                                        \
     auto __guard = ::xgboost::XGBoostAPIGuard();
@@ -30,7 +35,7 @@
 #define API_END()                                                              \
   } catch (dmlc::Error & _except_) {                                           \
     return XGBAPIHandleException(_except_);                                    \
-  } catch (std::exception const &_except_) {                                   \
+  } catch (std::exception const& _except_) {                                   \
     return XGBAPIHandleException(dmlc::Error(_except_.what()));                \
   }                                                                            \
   return 0; // NOLINT(*)
@@ -48,7 +53,7 @@ void XGBAPISetLastError(const char* msg);
  * \param e the exception
  * \return the return value of API after exception is handled
  */
-inline int XGBAPIHandleException(const dmlc::Error &e) {
+inline int XGBAPIHandleException(const dmlc::Error& e) {
   XGBAPISetLastError(e.what());
   return -1;
 }

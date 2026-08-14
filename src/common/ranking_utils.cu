@@ -1,27 +1,27 @@
 /**
- * Copyright 2023 by XGBoost Contributors
+ * Copyright 2023-2026, XGBoost Contributors
  */
 #include <thrust/functional.h>                  // for maximum
 #include <thrust/iterator/counting_iterator.h>  // for make_counting_iterator
 #include <thrust/logical.h>                     // for none_of, all_of
-#include <thrust/pair.h>                        // for pair, make_pair
 #include <thrust/reduce.h>                      // for reduce
 #include <thrust/scan.h>                        // for inclusive_scan
 
-#include <cstddef>                              // for size_t
+#include <cstddef>           // for size_t
+#include <cuda/std/utility>  // for pair
 
-#include "algorithm.cuh"                        // for SegmentedArgSort
-#include "cuda_context.cuh"                     // for CUDAContext
-#include "device_helpers.cuh"                   // for MakeTransformIterator, LaunchN
-#include "optional_weight.h"                    // for MakeOptionalWeights, OptionalWeights
-#include "ranking_utils.cuh"                    // for ThreadsForMean
+#include "algorithm.cuh"       // for SegmentedArgSort
+#include "cuda_context.cuh"    // for CUDAContext
+#include "device_helpers.cuh"  // for MakeTransformIterator, LaunchN
+#include "optional_weight.h"   // for MakeOptionalWeights, OptionalWeights
+#include "ranking_utils.cuh"   // for ThreadsForMean
 #include "ranking_utils.h"
-#include "threading_utils.cuh"                  // for SegmentedTrapezoidThreads
-#include "xgboost/base.h"                       // for XGBOOST_DEVICE, bst_group_t
-#include "xgboost/context.h"                    // for Context
-#include "xgboost/linalg.h"                     // for VectorView, All, Range
-#include "xgboost/logging.h"                    // for CHECK
-#include "xgboost/span.h"                       // for Span
+#include "threading_utils.cuh"  // for SegmentedTrapezoidThreads
+#include "xgboost/base.h"       // for XGBOOST_DEVICE, bst_group_t
+#include "xgboost/context.h"    // for Context
+#include "xgboost/linalg.h"     // for VectorView, All, Range
+#include "xgboost/logging.h"    // for CHECK
+#include "xgboost/span.h"       // for Span
 
 namespace xgboost::ltr {
 namespace cuda_impl {
@@ -30,10 +30,10 @@ void CalcQueriesDCG(Context const* ctx, linalg::VectorView<float const> d_labels
                     common::Span<bst_group_t const> d_group_ptr, std::size_t k,
                     linalg::VectorView<double> out_dcg) {
   CHECK_EQ(d_group_ptr.size() - 1, out_dcg.Size());
-  using IdxGroup = thrust::pair<std::size_t, std::size_t>;
+  using IdxGroup = cuda::std::pair<std::size_t, std::size_t>;
   auto group_it = dh::MakeTransformIterator<IdxGroup>(
       thrust::make_counting_iterator(0ull), [=] XGBOOST_DEVICE(std::size_t idx) {
-        return thrust::make_pair(idx, dh::SegmentId(d_group_ptr, idx));  // NOLINT
+        return cuda::std::make_pair(idx, dh::SegmentId(d_group_ptr, idx));
       });
   auto value_it = dh::MakeTransformIterator<double>(
       group_it,
@@ -61,13 +61,13 @@ void CalcQueriesDCG(Context const* ctx, linalg::VectorView<float const> d_labels
 
   CHECK(out_dcg.Contiguous());
   std::size_t bytes;
-  cub::DeviceSegmentedReduce::Sum(nullptr, bytes, value_it, out_dcg.Values().data(),
-                                  d_group_ptr.size() - 1, d_group_ptr.data(),
-                                  d_group_ptr.data() + 1, ctx->CUDACtx()->Stream());
+  dh::safe_cuda(cub::DeviceSegmentedReduce::Sum(nullptr, bytes, value_it, out_dcg.Values().data(),
+                                                d_group_ptr.size() - 1, d_group_ptr.data(),
+                                                d_group_ptr.data() + 1, ctx->CUDACtx()->Stream()));
   dh::TemporaryArray<char> temp(bytes);
-  cub::DeviceSegmentedReduce::Sum(temp.data().get(), bytes, value_it, out_dcg.Values().data(),
-                                  d_group_ptr.size() - 1, d_group_ptr.data(),
-                                  d_group_ptr.data() + 1, ctx->CUDACtx()->Stream());
+  dh::safe_cuda(cub::DeviceSegmentedReduce::Sum(
+      temp.data().get(), bytes, value_it, out_dcg.Values().data(), d_group_ptr.size() - 1,
+      d_group_ptr.data(), d_group_ptr.data() + 1, ctx->CUDACtx()->Stream()));
 }
 
 void CalcQueriesInvIDCG(Context const* ctx, linalg::VectorView<float const> d_labels,
@@ -158,7 +158,7 @@ void RankingCache::InitOnCUDA(Context const* ctx, MetaInfo const& info) {
   auto d_threads_group_ptr = threads_group_ptr_.DeviceSpan();
   if (param_.HasTruncation()) {
     n_cuda_threads_ =
-        common::SegmentedTrapezoidThreads(d_group_ptr, d_threads_group_ptr, Param().NumPair());
+        common::SegmentedTrapezoidThreads(ctx, d_group_ptr, d_threads_group_ptr, Param().NumPair());
   } else {
     auto n_pairs = Param().NumPair();
     dh::LaunchN(n_groups, cuctx->Stream(),
@@ -171,7 +171,7 @@ void RankingCache::InitOnCUDA(Context const* ctx, MetaInfo const& info) {
   sorted_idx_cache_.SetDevice(ctx->Device());
   sorted_idx_cache_.Resize(info.labels.Size(), 0);
 
-  auto weight = common::MakeOptionalWeights(ctx, info.weights_);
+  auto weight = common::MakeOptionalWeights(ctx->Device(), info.weights_);
   auto w_it =
       dh::MakeTransformIterator<double>(thrust::make_counting_iterator(0ul), WeightOp{weight});
   weight_norm_ = static_cast<double>(n_groups) / thrust::reduce(w_it, w_it + n_groups);

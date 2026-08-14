@@ -1,5 +1,5 @@
 /**
- * Copyright 2015-2023 by XGBoost Contributors
+ * Copyright 2015-2026, XGBoost Contributors
  * \file math.h
  * \brief additional math utils
  * \author Tianqi Chen
@@ -12,13 +12,16 @@
 #include <algorithm>    // for max
 #include <cmath>        // for exp, abs, log, lgamma
 #include <limits>       // for numeric_limits
-#include <type_traits>  // for is_floating_point, conditional, is_signed, is_same, declval, enable_if
+#include <type_traits>  // for is_floating_point_v, conditional, is_signed, is_same, declval
 #include <utility>      // for pair
 
 namespace xgboost {
 namespace common {
 
-template <typename T> XGBOOST_DEVICE T Sqr(T const &w) { return w * w; }
+template <typename T>
+XGBOOST_DEVICE T Sqr(T const &w) {
+  return w * w;
+}
 
 /*!
  * \brief calculate the sigmoid of the input.
@@ -38,21 +41,21 @@ XGBOOST_DEVICE inline double Sigmoid(double x) {
   auto y = 1.0 / denom;
   return y;
 }
+
+XGBOOST_DEVICE inline float Logit(float x) { return -logf(1.0f / x - 1.0f); }
+
 /*!
  * \brief Equality test for both integer and floating point.
  */
 template <typename T, typename U>
 XGBOOST_DEVICE constexpr bool CloseTo(T a, U b) {
-  using Casted =
-      typename std::conditional<
-        std::is_floating_point<T>::value || std::is_floating_point<U>::value,
-          double,
-          typename std::conditional<
-            std::is_signed<T>::value || std::is_signed<U>::value,
-            int64_t,
-            uint64_t>::type>::type;
-  return std::is_floating_point<Casted>::value ?
-      std::abs(static_cast<Casted>(a) -static_cast<Casted>(b)) < 1e-6 : a == b;
+  using Casted = typename std::conditional_t<
+      std::is_floating_point_v<T> || std::is_floating_point_v<U>, double,
+      typename std::conditional_t<std::is_signed_v<T> || std::is_signed_v<U>, std::int64_t,
+                                  std::uint64_t>>;
+  return std::is_floating_point_v<Casted>
+             ? std::abs(static_cast<Casted>(a) - static_cast<Casted>(b)) < 1e-6
+             : a == b;
 }
 
 /*!
@@ -64,14 +67,13 @@ XGBOOST_DEVICE constexpr bool CloseTo(T a, U b) {
  * \param end end iterator of input
  */
 template <typename Iterator>
-XGBOOST_DEVICE inline void Softmax(Iterator start, Iterator end) {
-  static_assert(std::is_same<bst_float,
-                typename std::remove_reference<
-                  decltype(std::declval<Iterator>().operator*())>::type
-                >::value,
-                "Values should be of type bst_float");
-  bst_float wmax = *start;
-  for (Iterator i = start+1; i != end; ++i) {
+XGBOOST_DEVICE void Softmax(Iterator start, Iterator end) {
+  static_assert(
+      std::is_same_v<
+          float, typename std::remove_reference_t<decltype(std::declval<Iterator>().operator*())>>,
+      "Values should be of type float");
+  float wmax = *start;
+  for (Iterator i = start + 1; i != end; ++i) {
     wmax = fmaxf(*i, wmax);
   }
   double wsum = 0.0f;
@@ -84,6 +86,21 @@ XGBOOST_DEVICE inline void Softmax(Iterator start, Iterator end) {
   }
 }
 
+/** @brief softplus \f$ln(1 + e^x)\f$ */
+template <typename F>
+XGBOOST_DEVICE std::enable_if_t<std::is_floating_point_v<F>, F> SoftPlus(F x) {
+  if (x > 0.0) {
+    return x + std::log1p(std::exp(-x));
+  }
+  return std::log1p(std::exp(x));
+}
+
+template <typename F>
+XGBOOST_DEVICE std::enable_if_t<std::is_floating_point_v<F>, F> SoftPlusInv(F x) {
+  x = std::max(x, kRtEps);
+  return x + std::log(-std::expm1(-x));
+}
+
 /*!
  * \brief Find the maximum iterator within the iterators
  * \param begin The beginning iterator.
@@ -91,7 +108,7 @@ XGBOOST_DEVICE inline void Softmax(Iterator start, Iterator end) {
  * \return the iterator point to the maximum value.
  * \tparam Iterator The type of the iterator.
  */
-template<typename Iterator>
+template <typename Iterator>
 XGBOOST_DEVICE inline Iterator FindMaxIndex(Iterator begin, Iterator end) {
   Iterator maxit = begin;
   for (Iterator it = begin; it != end; ++it) {
@@ -121,7 +138,7 @@ inline float LogSum(float x, float y) {
  * \return the iterator point to the maximum value.
  * \tparam Iterator The type of the iterator.
  */
-template<typename Iterator>
+template <typename Iterator>
 inline float LogSum(Iterator begin, Iterator end) {
   float mx = *begin;
   for (Iterator it = begin; it != end; ++it) {
@@ -137,9 +154,7 @@ inline float LogSum(Iterator begin, Iterator end) {
 // Redefined here to workaround a VC bug that doesn't support overloading for integer
 // types.
 template <typename T>
-XGBOOST_DEVICE typename std::enable_if<
-  std::numeric_limits<T>::is_integer, bool>::type
-CheckNAN(T) {
+XGBOOST_DEVICE typename std::enable_if_t<std::numeric_limits<T>::is_integer, bool> CheckNAN(T) {
   return false;
 }
 
@@ -173,15 +188,16 @@ double LogGamma(double v);
 
 #else  // Not R or R with GPU.
 
-template<typename T>
+template <typename T>
 XGBOOST_DEVICE inline T LogGamma(T v) {
 #ifdef _MSC_VER
 
 #if _MSC_VER >= 1800
   return lgamma(v);
 #else
-#pragma message("Warning: lgamma function was not available until VS2013"\
-                ", poisson regression will be disabled")
+#pragma message(                                              \
+    "Warning: lgamma function was not available until VS2013" \
+    ", poisson regression will be disabled")
   utils::Error("lgamma function was not available until VS2013");
   return static_cast<T>(1.0);
 #endif  // _MSC_VER >= 1800

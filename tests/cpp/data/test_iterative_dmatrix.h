@@ -1,11 +1,11 @@
 /**
- * Copyright 2022-2023, XGBoost contributors
+ * Copyright 2022-2024, XGBoost contributors
  */
 #pragma once
 #include <xgboost/context.h>  // for Context
 
-#include <limits>             // for numeric_limits
-#include <memory>             // for make_shared
+#include <limits>  // for numeric_limits
+#include <memory>  // for make_shared
 
 #include "../../../src/data/iterative_dmatrix.h"
 #include "../helpers.h"
@@ -29,7 +29,6 @@ void TestRefDMatrix(Context const* ctx, Cuts&& get_cuts) {
       auto const& cuts_1 = get_cuts(page_1);
       ASSERT_EQ(cuts_0.Values(), cuts_1.Values());
       ASSERT_EQ(cuts_0.Ptrs(), cuts_1.Ptrs());
-      ASSERT_EQ(cuts_0.MinValues(), cuts_1.MinValues());
     }
   }
 
@@ -54,7 +53,6 @@ void TestRefDMatrix(Context const* ctx, Cuts&& get_cuts) {
       auto const& cuts_1 = get_cuts(page_1);
       ASSERT_EQ(cuts_0.Values(), cuts_1.Values());
       ASSERT_EQ(cuts_0.Ptrs(), cuts_1.Ptrs());
-      ASSERT_EQ(cuts_0.MinValues(), cuts_1.MinValues());
     }
   }
 }

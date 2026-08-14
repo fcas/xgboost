@@ -1,5 +1,5 @@
 /**
- * Copyright 2015-2023, XGBoost Contributors
+ * Copyright 2015-2025, XGBoost Contributors
  * \file simple_dmatrix.h
  * \brief In-memory version of DMatrix.
  * \author Tianqi Chen
@@ -21,8 +21,7 @@ class SimpleDMatrix : public DMatrix {
  public:
   SimpleDMatrix() = default;
   template <typename AdapterT>
-  explicit SimpleDMatrix(AdapterT* adapter, float missing, int nthread,
-                         DataSplitMode data_split_mode = DataSplitMode::kRow);
+  explicit SimpleDMatrix(AdapterT* adapter, float missing, std::int32_t nthread);
 
   explicit SimpleDMatrix(dmlc::Stream* in_stream);
   ~SimpleDMatrix() override = default;
@@ -33,9 +32,7 @@ class SimpleDMatrix : public DMatrix {
   const MetaInfo& Info() const override;
   Context const* Ctx() const override { return &fmat_ctx_; }
 
-  bool SingleColBlock() const override { return true; }
   DMatrix* Slice(common::Span<int32_t const> ridxs) override;
-  DMatrix* SliceCol(int num_slices, int slice_id) override;
 
   /*! \brief magic number used to identify SimpleDMatrix binary files */
   static const int kMagic = 0xffffab01;
@@ -60,16 +57,6 @@ class SimpleDMatrix : public DMatrix {
   bool EllpackExists() const override { return static_cast<bool>(ellpack_page_); }
   bool GHistIndexExists() const override { return static_cast<bool>(gradient_index_); }
   bool SparsePageExists() const override { return true; }
-
-  /**
-   * \brief Reindex the features based on a global view.
-   *
-   * In some cases (e.g. column-wise data split and vertical federated learning), features are
-   * loaded locally with indices starting from 0. However, all the algorithms assume the features
-   * are globally indexed, so we reindex the features based on the offset needed to obtain the
-   * global view.
-   */
-  void ReindexFeatures(Context const* ctx);
 
  private:
   // Context used only for DMatrix initialization.

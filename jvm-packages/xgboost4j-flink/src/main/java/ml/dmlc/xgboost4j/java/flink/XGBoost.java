@@ -54,14 +54,23 @@ public class XGBoost {
 
     private final Map<String, Object> params;
     private final int round;
-    private final Map<String, String> workerEnvs;
+    private final Map<String, Object> workerEnvs;
 
-    public MapFunction(Map<String, Object> params, int round, Map<String, String> workerEnvs) {
+    public MapFunction(Map<String, Object> params, int round, Map<String, Object> workerEnvs) {
       this.params = params;
       this.round = round;
       this.workerEnvs = workerEnvs;
     }
 
+    /**
+     * Trains the XGBoost model based on the data elements in the given partition.
+     *
+     * @param it The iterable object consisting of Tuple2 instances where the first field (f0)
+     *           is a Vector representing the features and the second field (f1) is a Double
+     *           representing the label.
+     * @param collector The collector object that is used to emit the trained XGBoost model.
+     * @throws XGBoostError Error thrown during training.
+     */
     public void mapPartition(java.lang.Iterable<Tuple2<Vector, Double>> it,
                              Collector<XGBoostModel> collector) throws XGBoostError {
       workerEnvs.put(
@@ -174,9 +183,9 @@ public class XGBoost {
                                    int numBoostRound) throws Exception {
     final RabitTracker tracker =
         new RabitTracker(dtrain.getExecutionEnvironment().getParallelism());
-    if (tracker.start(0L)) {
+    if (tracker.start()) {
       return dtrain
-        .mapPartition(new MapFunction(params, numBoostRound, tracker.getWorkerEnvs()))
+        .mapPartition(new MapFunction(params, numBoostRound, tracker.getWorkerArgs()))
         .reduce((x, y) -> x)
         .collect()
         .get(0);

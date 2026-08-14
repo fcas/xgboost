@@ -1,5 +1,5 @@
 /**
- * Copyright 2023, XGBoost contributors
+ * Copyright 2023-2026, XGBoost contributors
  *
  * Vocabulary explanation:
  *
@@ -13,14 +13,15 @@
  */
 #ifndef XGBOOST_OBJECTIVE_LAMBDARANK_OBJ_H_
 #define XGBOOST_OBJECTIVE_LAMBDARANK_OBJ_H_
-#include <algorithm>                       // for min, max
-#include <cassert>                         // for assert
-#include <cmath>                           // for log, abs
-#include <cstddef>                         // for size_t
-#include <functional>                      // for greater
-#include <memory>                          // for shared_ptr
-#include <random>                          // for minstd_rand, uniform_int_distribution
-#include <vector>                          // for vector
+#include <algorithm>   // for min, max
+#include <cassert>     // for assert
+#include <cmath>       // for log, abs
+#include <cstddef>     // for size_t
+#include <cstdint>     // for uint32_t
+#include <functional>  // for greater
+#include <memory>      // for shared_ptr
+#include <random>      // for minstd_rand, uniform_int_distribution
+#include <vector>      // for vector
 
 #include "../common/algorithm.h"           // for ArgSort
 #include "../common/math.h"                // for Sigmoid
@@ -80,8 +81,14 @@ XGBOOST_DEVICE inline double DeltaMAP(float y_high, float y_low, std::size_t ran
   }
   return delta;
 }
-
-template <bool unbiased, typename Delta>
+/**
+ * @brief Calculate lambda gradient based on delta weight.
+ *
+ * @tparam unbiased Whether positioin bias is taken into account.
+ * @tparam norm_by_diff Do we need to normalize the delta metric using the score difference.
+ * @tparam Functor for calculating the delta weight.
+ */
+template <bool unbiased, bool norm_by_diff, typename Delta>
 XGBOOST_DEVICE GradientPair
 LambdaGrad(linalg::VectorView<float const> labels, common::Span<float const> predts,
            common::Span<size_t const> sorted_idx,
@@ -114,7 +121,7 @@ LambdaGrad(linalg::VectorView<float const> labels, common::Span<float const> pre
   // Change in metric score like \delta NDCG or \delta MAP
   double delta_metric = std::abs(delta(y_high, y_low, rank_high, rank_low));
 
-  if (best_score != worst_score) {
+  if (norm_by_diff && best_score != worst_score) {
     delta_metric /= (delta_score + 0.01);
   }
 
@@ -148,7 +155,7 @@ XGBOOST_DEVICE inline GradientPair Repulse(GradientPair pg) {
 }
 
 namespace cuda_impl {
-void LambdaRankGetGradientNDCG(Context const* ctx, std::int32_t iter,
+void LambdaRankGetGradientNDCG(Context const* ctx, std::uint32_t seed,
                                HostDeviceVector<float> const& preds, MetaInfo const& info,
                                std::shared_ptr<ltr::NDCGCache> p_cache,
                                linalg::VectorView<double const> t_plus,   // input bias ratio
@@ -162,7 +169,7 @@ void LambdaRankGetGradientNDCG(Context const* ctx, std::int32_t iter,
 void MAPStat(Context const* ctx, MetaInfo const& info, common::Span<std::size_t const> d_rank_idx,
              std::shared_ptr<ltr::MAPCache> p_cache);
 
-void LambdaRankGetGradientMAP(Context const* ctx, std::int32_t iter,
+void LambdaRankGetGradientMAP(Context const* ctx, std::uint32_t seed,
                               HostDeviceVector<float> const& predt, MetaInfo const& info,
                               std::shared_ptr<ltr::MAPCache> p_cache,
                               linalg::VectorView<double const> t_plus,   // input bias ratio
@@ -170,7 +177,7 @@ void LambdaRankGetGradientMAP(Context const* ctx, std::int32_t iter,
                               linalg::VectorView<double> li, linalg::VectorView<double> lj,
                               linalg::Matrix<GradientPair>* out_gpair);
 
-void LambdaRankGetGradientPairwise(Context const* ctx, std::int32_t iter,
+void LambdaRankGetGradientPairwise(Context const* ctx, std::uint32_t seed,
                                    HostDeviceVector<float> const& predt, const MetaInfo& info,
                                    std::shared_ptr<ltr::RankingCache> p_cache,
                                    linalg::VectorView<double const> ti_plus,   // input bias ratio
@@ -204,7 +211,7 @@ void MAPStat(Context const* ctx, linalg::VectorView<float const> label,
  * \tparam Op Functor for upgrading a pair of gradients.
  *
  * \param ctx     The global context.
- * \param iter    The boosting iteration.
+ * \param seed    Seed for sampling pairs.
  * \param cache   ltr cache.
  * \param g       The current query group
  * \param g_label label The labels for the current query group
@@ -213,7 +220,7 @@ void MAPStat(Context const* ctx, linalg::VectorView<float const> label,
  *                the ranked list (labels sorted according to model scores).
  */
 template <typename Op>
-void MakePairs(Context const* ctx, std::int32_t iter,
+void MakePairs(Context const* ctx, std::uint32_t seed,
                std::shared_ptr<ltr::RankingCache> const cache, bst_group_t g,
                linalg::VectorView<float const> g_label, common::Span<std::size_t const> g_rank,
                Op op) {
@@ -221,15 +228,15 @@ void MakePairs(Context const* ctx, std::int32_t iter,
   ltr::position_t cnt = group_ptr[g + 1] - group_ptr[g];
 
   if (cache->Param().HasTruncation()) {
-    for (std::size_t i = 0; i < std::min(cnt, cache->Param().NumPair()); ++i) {
+    for (std::size_t i = 0, n = std::min(cnt, cache->Param().NumPair()); i < n; ++i) {
       for (std::size_t j = i + 1; j < cnt; ++j) {
         op(i, j);
       }
     }
   } else {
     CHECK_EQ(g_rank.size(), g_label.Size());
-    std::minstd_rand rnd(iter);
-    rnd.discard(g);  // fixme(jiamingy): honor the global seed
+
+    std::minstd_rand rnd(seed + static_cast<std::uint32_t>(g));
     // sort label according to the rank list
     auto it = common::MakeIndexTransformIter(
         [&g_rank, &g_label](std::size_t idx) { return g_label(g_rank[idx]); });
@@ -238,7 +245,6 @@ void MakePairs(Context const* ctx, std::int32_t iter,
     // permutation iterator to get the original label
     auto rev_it = common::MakeIndexTransformIter(
         [&](std::size_t idx) { return g_label(g_rank[y_sorted_idx[idx]]); });
-
     for (std::size_t i = 0; i < cnt;) {
       std::size_t j = i + 1;
       // find the bucket boundary

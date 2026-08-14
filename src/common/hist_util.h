@@ -1,5 +1,5 @@
 /**
- * Copyright 2017-2024 by XGBoost Contributors
+ * Copyright 2017-2026, XGBoost Contributors
  * \file hist_util.h
  * \brief Utility for fast histogram aggregation
  * \author Philip Cho, Tianqi Chen
@@ -8,16 +8,15 @@
 #define XGBOOST_COMMON_HIST_UTIL_H_
 
 #include <algorithm>
+#include <cmath>    // for nextafter
 #include <cstdint>  // for uint32_t
 #include <limits>
 #include <map>
-#include <memory>
 #include <utility>
 #include <vector>
 
 #include "categorical.h"
 #include "quantile.h"
-#include "row_set.h"
 #include "threading_utils.h"
 #include "xgboost/base.h"  // for bst_feature_t, bst_bin_t
 #include "xgboost/data.h"
@@ -26,6 +25,9 @@ namespace xgboost {
 class GHistIndexMatrix;
 
 namespace common {
+class AlignedFileWriteStream;
+class AlignedResourceReadStream;
+
 /*!
  * \brief A single row in global histogram index.
  *  Directly represent the global index in the histogram entry.
@@ -42,7 +44,6 @@ class HistogramCuts {
   void Swap(HistogramCuts&& that) noexcept(true) {
     std::swap(cut_values_, that.cut_values_);
     std::swap(cut_ptrs_, that.cut_ptrs_);
-    std::swap(min_vals_, that.min_vals_);
 
     std::swap(has_categorical_, that.has_categorical_);
     std::swap(max_cat_, that.max_cat_);
@@ -51,10 +52,8 @@ class HistogramCuts {
   void Copy(HistogramCuts const& that) {
     cut_values_.Resize(that.cut_values_.Size());
     cut_ptrs_.Resize(that.cut_ptrs_.Size());
-    min_vals_.Resize(that.min_vals_.Size());
     cut_values_.Copy(that.cut_values_);
     cut_ptrs_.Copy(that.cut_ptrs_);
-    min_vals_.Copy(that.min_vals_);
     has_categorical_ = that.has_categorical_;
     max_cat_ = that.max_cat_;
   }
@@ -62,10 +61,9 @@ class HistogramCuts {
  public:
   HostDeviceVector<float> cut_values_;   // NOLINT
   HostDeviceVector<uint32_t> cut_ptrs_;  // NOLINT
-  // storing minimum value in a sketch set.
-  HostDeviceVector<float> min_vals_;  // NOLINT
 
-  HistogramCuts();
+  HistogramCuts() = delete;
+  explicit HistogramCuts(bst_feature_t n_features);
   HistogramCuts(HistogramCuts const& that) { this->Copy(that); }
 
   HistogramCuts(HistogramCuts&& that) noexcept(true) {
@@ -85,10 +83,10 @@ class HistogramCuts {
   [[nodiscard]] bst_bin_t FeatureBins(bst_feature_t feature) const {
     return cut_ptrs_.ConstHostVector().at(feature + 1) - cut_ptrs_.ConstHostVector()[feature];
   }
+  [[nodiscard]] bst_feature_t NumFeatures() const { return this->cut_ptrs_.Size() - 1; }
 
-  std::vector<uint32_t> const& Ptrs()      const { return cut_ptrs_.ConstHostVector();   }
-  std::vector<float>    const& Values()    const { return cut_values_.ConstHostVector(); }
-  std::vector<float>    const& MinValues() const { return min_vals_.ConstHostVector();   }
+  std::vector<uint32_t> const& Ptrs() const { return cut_ptrs_.ConstHostVector(); }
+  std::vector<float> const& Values() const { return cut_values_.ConstHostVector(); }
 
   [[nodiscard]] bool HasCategorical() const { return has_categorical_; }
   [[nodiscard]] float MaxCategory() const { return max_cat_; }
@@ -102,8 +100,10 @@ class HistogramCuts {
     has_categorical_ = has_cat;
     max_cat_ = max_cat;
   }
-
-  [[nodiscard]] bst_bin_t TotalBins() const { return cut_ptrs_.ConstHostVector().back(); }
+  /**
+   * @brief The total number of histogram bins (excluding min values.)
+   */
+  [[nodiscard]] bst_bin_t TotalBins() const { return this->cut_values_.Size(); }
 
   // Return the index of a cut point that is strictly greater than the input
   // value, or the last available index if none exists
@@ -152,17 +152,41 @@ class HistogramCuts {
   }
 
   /**
-   * \brief Return numerical bin value given bin index.
+   * \brief Return a representative numerical value for a bin.
    */
   static float NumericBinValue(std::vector<std::uint32_t> const& ptrs,
-                               std::vector<float> const& vals, std::vector<float> const& mins,
-                               bst_feature_t fidx, bst_bin_t bin_idx) {
+                               std::vector<float> const& vals, bst_feature_t fidx,
+                               bst_bin_t bin_idx) {
     auto lower = static_cast<bst_bin_t>(ptrs[fidx]);
     if (bin_idx == lower) {
-      return mins[fidx];
+      return std::nextafter(vals[lower], -std::numeric_limits<float>::infinity());
     }
     return vals[bin_idx - 1];
   }
+
+  /**
+   * \brief Return the lower bound of a numerical bin.
+   */
+  static float NumericBinLowerBound(std::vector<std::uint32_t> const& ptrs,
+                                    std::vector<float> const& vals, bst_feature_t fidx,
+                                    bst_bin_t bin_idx) {
+    auto lower = static_cast<bst_bin_t>(ptrs[fidx]);
+    if (bin_idx == lower) {
+      return -std::numeric_limits<float>::infinity();
+    }
+    return vals[bin_idx - 1];
+  }
+
+  void SetDevice(DeviceOrd d) const {
+    this->cut_ptrs_.SetDevice(d);
+    this->cut_ptrs_.ConstDevicePointer();
+
+    this->cut_values_.SetDevice(d);
+    this->cut_values_.ConstDevicePointer();
+  }
+
+  void Save(common::AlignedFileWriteStream* fo) const;
+  [[nodiscard]] static HistogramCuts* Load(common::AlignedResourceReadStream* fi);
 };
 
 /**
@@ -473,7 +497,7 @@ class ParallelGHistBuilder {
 
     CHECK_EQ(nodes, targeted_hists.size());
 
-    nodes_    = nodes;
+    nodes_ = nodes;
     nthreads_ = nthreads;
 
     MatchThreadsToNodes(space);
@@ -538,11 +562,11 @@ class ParallelGHistBuilder {
 
     for (size_t tid = 0; tid < nthreads_; ++tid) {
       size_t begin = chunck_size * tid;
-      size_t end   = std::min(begin + chunck_size, space_size);
+      size_t end = std::min(begin + chunck_size, space_size);
 
       if (begin < space_size) {
         size_t nid_begin = space.GetFirstDimension(begin);
-        size_t nid_end   = space.GetFirstDimension(end-1);
+        size_t nid_end = space.GetFirstDimension(end - 1);
 
         for (size_t nid = nid_begin; nid <= nid_end; ++nid) {
           // true - means thread 'tid' will work to compute partial hist for node 'nid'
@@ -625,8 +649,8 @@ class ParallelGHistBuilder {
 
 // construct a histogram via histogram aggregation
 template <bool any_missing>
-void BuildHist(Span<GradientPair const> gpair, const RowSetCollection::Elem row_indices,
-               const GHistIndexMatrix& gmat, GHistRow hist, bool force_read_by_column = false);
+void BuildHist(Span<GradientPair const> gpair, Span<bst_idx_t const> row_indices,
+               const GHistIndexMatrix& gmat, GHistRow hist, bool read_by_column);
 }  // namespace common
 }  // namespace xgboost
 #endif  // XGBOOST_COMMON_HIST_UTIL_H_

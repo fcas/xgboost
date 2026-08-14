@@ -2,12 +2,13 @@
 
 import base64
 
-# pylint: disable=fixme, too-many-ancestors, protected-access, no-member, invalid-name
-# pylint: disable=too-few-public-methods, too-many-lines, too-many-branches
+# pylint: disable=fixme, protected-access, no-member
+# pylint: disable=too-many-lines, too-many-branches
 import json
 import logging
 import os
 from collections import namedtuple
+from dataclasses import asdict
 from typing import (
     Any,
     Callable,
@@ -23,7 +24,7 @@ from typing import (
 
 import numpy as np
 import pandas as pd
-from pyspark import RDD, SparkConf, SparkContext, cloudpickle
+from pyspark import cloudpickle
 from pyspark.ml import Estimator, Model
 from pyspark.ml.functions import array_to_vector, vector_to_array
 from pyspark.ml.linalg import VectorUDT
@@ -45,11 +46,23 @@ from pyspark.ml.util import (
     MLWritable,
     MLWriter,
 )
-from pyspark.resource import ResourceProfileBuilder, TaskResourceRequests
-from pyspark.sql import Column, DataFrame
-from pyspark.sql.functions import col, countDistinct, pandas_udf, rand, struct
+from pyspark.resource import (
+    ResourceProfile,
+    ResourceProfileBuilder,
+    TaskResourceRequests,
+)
+from pyspark.sql import Column, DataFrame, SparkSession
+from pyspark.sql.functions import (
+    col,
+    countDistinct,
+    pandas_udf,
+    rand,
+    struct,
+    unwrap_udt,
+)
 from pyspark.sql.types import (
     ArrayType,
+    BooleanType,
     DoubleType,
     FloatType,
     IntegerType,
@@ -59,14 +72,14 @@ from pyspark.sql.types import (
 )
 from scipy.special import expit, softmax  # pylint: disable=no-name-in-module
 
-import xgboost
-from xgboost import XGBClassifier
-from xgboost.compat import is_cudf_available, is_cupy_available
-from xgboost.core import Booster, _check_distributed_params
-from xgboost.sklearn import DEFAULT_N_ESTIMATORS, XGBModel, _can_use_qdm
-from xgboost.training import train as worker_train
-
+from .._c_api import _py_version
 from .._typing import ArrayLike
+from ..collective import Config
+from ..compat import import_cupy, is_cudf_available, is_cupy_available
+from ..config import config_context, get_config
+from ..core import Booster, _check_distributed_params
+from ..sklearn import DEFAULT_N_ESTIMATORS, XGBClassifier, XGBModel, _can_use_qdm
+from ..training import train as worker_train
 from .data import (
     _read_csr_matrix_from_unwrapped_spark_vec,
     alias,
@@ -82,15 +95,16 @@ from .params import (
     HasFeaturesCols,
     HasQueryIdCol,
 )
+from .summary import XGBoostTrainingSummary
 from .utils import (
     CommunicatorContext,
     _get_default_params_from_func,
     _get_gpu_id,
+    _get_host_ip,
     _get_max_num_concurrent_tasks,
     _get_rabit_args,
-    _get_spark_session,
+    _is_connect,
     _is_local,
-    _is_standalone_or_localcluster,
     deserialize_booster,
     deserialize_xgb_model,
     get_class_name,
@@ -120,7 +134,8 @@ _pyspark_specific_params = [
     "qid_col",
     "repartition_random_shuffle",
     "pred_contrib_col",
-    "use_gpu",
+    "launch_tracker_on_driver",
+    "coll_cfg",
 ]
 
 _non_booster_params = ["missing", "n_estimators", "feature_types", "feature_weights"]
@@ -138,7 +153,6 @@ _pyspark_param_alias_map = {
 _inverse_pyspark_param_alias_map = {v: k for k, v in _pyspark_param_alias_map.items()}
 
 _unsupported_xgb_params = [
-    "gpu_id",  # we have "device" pyspark param instead.
     "enable_categorical",  # Use feature_types param to specify categorical feature instead
     "n_jobs",  # Do not allow user to set it, will use `spark.task.cpus` value instead.
     "nthread",  # Ditto
@@ -214,16 +228,6 @@ class _SparkXGBParams(
         ),
         TypeConverters.toString,
     )
-    use_gpu = Param(
-        Params._dummy(),
-        "use_gpu",
-        (
-            "Deprecated, use `device` instead. A boolean variable. Set use_gpu=true "
-            "if the executors are running on GPU instances. Currently, only one GPU per"
-            " task is supported."
-        ),
-        TypeConverters.toBoolean,
-    )
     force_repartition = Param(
         Params._dummy(),
         "force_repartition",
@@ -246,6 +250,25 @@ class _SparkXGBParams(
         "A list of str to specify feature names.",
         TypeConverters.toList,
     )
+    launch_tracker_on_driver = Param(
+        Params._dummy(),
+        "launch_tracker_on_driver",
+        "A boolean variable. Set launch_tracker_on_driver to true if you want the tracker to be "
+        "launched on the driver side; otherwise, it will be launched on the executor side.",
+        TypeConverters.toBoolean,
+    )
+    coll_cfg = Param(
+        Params._dummy(),
+        "coll_cfg",
+        "xgboost.collective.Config. The collective configuration.",
+        TypeConverters.identity,
+    )
+
+    def set_coll_cfg(self, value: Config) -> "_SparkXGBParams":
+        """Set collective configuration"""
+        assert isinstance(value, Config)
+        self.set(self.coll_cfg, value)
+        return self
 
     def set_device(self, value: str) -> "_SparkXGBParams":
         """Set device, optional value: cpu, cuda, gpu"""
@@ -347,13 +370,11 @@ class _SparkXGBParams(
                 predict_params[param.name] = self.getOrDefault(param)
         return predict_params
 
-    def _validate_gpu_params(
-        self, spark_version: str, conf: SparkConf, is_local: bool = False
-    ) -> None:
+    def _validate_gpu_params(self, spark_session: SparkSession) -> None:
         """Validate the gpu parameters and gpu configurations"""
 
-        if self._run_on_gpu():
-            if is_local:
+        if self._run_on_gpu(spark_session):
+            if _is_local(spark_session):
                 # Supporting GPU training in Spark local mode is just for debugging
                 # purposes, so it's okay for printing the below warning instead of
                 # checking the real gpu numbers and raising the exception.
@@ -363,13 +384,17 @@ class _SparkXGBParams(
                     self.getOrDefault(self.num_workers),
                 )
             else:
-                executor_gpus = conf.get("spark.executor.resource.gpu.amount")
+                executor_gpus = spark_session.conf.get(
+                    "spark.executor.resource.gpu.amount", None
+                )
                 if executor_gpus is None:
                     raise ValueError(
                         "The `spark.executor.resource.gpu.amount` is required for training"
                         " on GPU."
                     )
-                gpu_per_task = conf.get("spark.task.resource.gpu.amount")
+                gpu_per_task = spark_session.conf.get(
+                    "spark.task.resource.gpu.amount", None
+                )
                 if gpu_per_task is not None and float(gpu_per_task) > 1.0:
                     get_logger(self.__class__.__name__).warning(
                         "The configuration assigns %s GPUs to each Spark task, but each "
@@ -377,35 +402,8 @@ class _SparkXGBParams(
                         "unnecessary GPU waste",
                         gpu_per_task,
                     )
-                # For 3.5.1+, Spark supports task stage-level scheduling for
-                #                          Yarn/K8s/Standalone/Local cluster
-                # From 3.4.0 ~ 3.5.0, Spark only supports task stage-level scheduing for
-                #                           Standalone/Local cluster
-                # For spark below 3.4.0, Task stage-level scheduling is not supported.
-                #
-                # With stage-level scheduling, spark.task.resource.gpu.amount is not required
-                # to be set explicitly. Or else, spark.task.resource.gpu.amount is a must-have and
-                # must be set to 1.0
-                if spark_version < "3.4.0" or (
-                    "3.4.0" <= spark_version < "3.5.1"
-                    and not _is_standalone_or_localcluster(conf)
-                ):
-                    if gpu_per_task is not None:
-                        if float(gpu_per_task) < 1.0:
-                            raise ValueError(
-                                "XGBoost doesn't support GPU fractional configurations. Please set "
-                                "`spark.task.resource.gpu.amount=spark.executor.resource.gpu."
-                                "amount`. To enable GPU fractional configurations, you can try "
-                                "standalone/localcluster with spark 3.4.0+ and"
-                                "YARN/K8S with spark 3.5.1+"
-                            )
-                    else:
-                        raise ValueError(
-                            "The `spark.task.resource.gpu.amount` is required for training"
-                            " on GPU."
-                        )
 
-    def _validate_params(self) -> None:
+    def _validate_params(self, spark_session: SparkSession) -> None:
         # pylint: disable=too-many-branches
         init_model = self.getOrDefault("xgb_model")
         if init_model is not None and not isinstance(init_model, Booster):
@@ -425,12 +423,6 @@ class _SparkXGBParams(
             raise ValueError(
                 "The `exact` tree method is not supported for distributed systems."
             )
-
-        if self.getOrDefault(self.features_cols):
-            if not self._run_on_gpu():
-                raise ValueError(
-                    "features_col param with list value requires `device=cuda`."
-                )
 
         if self.getOrDefault("objective") is not None:
             if not isinstance(self.getOrDefault("objective"), str):
@@ -453,10 +445,7 @@ class _SparkXGBParams(
                 )
 
         if self.getOrDefault("early_stopping_rounds") is not None:
-            if not (
-                self.isDefined(self.validationIndicatorCol)
-                and self.getOrDefault(self.validationIndicatorCol) != ""
-            ):
+            if not self._col_is_defined_not_empty(self.validationIndicatorCol):
                 raise ValueError(
                     "If 'early_stopping_rounds' param is set, you need to set "
                     "'validation_indicator_col' param as well."
@@ -482,18 +471,16 @@ class _SparkXGBParams(
                     "`pyspark.ml.linalg.Vector` type."
                 )
 
-        ss = _get_spark_session()
-        sc = ss.sparkContext
-        self._validate_gpu_params(ss.version, sc.getConf(), _is_local(sc))
+        self._validate_gpu_params(spark_session)
 
-    def _run_on_gpu(self) -> bool:
+    def _run_on_gpu(self, spark_session: SparkSession) -> bool:
+        # pylint: disable=unused-argument
         """If train or transform on the gpu according to the parameters"""
 
-        return (
-            use_cuda(self.getOrDefault(self.device))
-            or self.getOrDefault(self.use_gpu)
-            or self.getOrDefault(self.getParam("tree_method")) == "gpu_hist"
-        )
+        return use_cuda(self.getOrDefault(self.device))
+
+    def _col_is_defined_not_empty(self, param: "Param[str]") -> bool:
+        return self.isDefined(param) and self.getOrDefault(param) not in (None, "")
 
 
 def _validate_and_convert_feature_col_as_float_col_list(
@@ -527,7 +514,8 @@ def _validate_and_convert_feature_col_as_array_col(
             (DoubleType, FloatType, LongType, IntegerType, ShortType),
         ):
             raise ValueError(
-                "If feature column is array type, its elements must be number type."
+                "If feature column is array type, its elements must be number type, "
+                f"got {features_col_datatype.elementType}."
             )
         features_array_col = features_col.cast(ArrayType(FloatType())).alias(alias.data)
     elif isinstance(features_col_datatype, VectorUDT):
@@ -537,34 +525,14 @@ def _validate_and_convert_feature_col_as_array_col(
     else:
         raise ValueError(
             "feature column must be array type or `pyspark.ml.linalg.Vector` type, "
-            "if you want to use multiple numetric columns as features, please use "
+            "if you want to use multiple numeric columns as features, please use "
             "`pyspark.ml.transform.VectorAssembler` to assemble them into a vector "
             "type column first."
         )
     return features_array_col
 
 
-def _get_unwrap_udt_fn() -> Callable[[Union[Column, str]], Column]:
-    try:
-        from pyspark.sql.functions import unwrap_udt
-
-        return unwrap_udt
-    except ImportError:
-        pass
-
-    try:
-        from pyspark.databricks.sql.functions import unwrap_udt as databricks_unwrap_udt
-
-        return databricks_unwrap_udt
-    except ImportError as exc:
-        raise RuntimeError(
-            "Cannot import pyspark `unwrap_udt` function. Please install pyspark>=3.4 "
-            "or run on Databricks Runtime."
-        ) from exc
-
-
 def _get_unwrapped_vec_cols(feature_col: Column) -> List[Column]:
-    unwrap_udt = _get_unwrap_udt_fn()
     features_unwrapped_vec_col = unwrap_udt(feature_col)
 
     # After a `pyspark.ml.linalg.VectorUDT` type column being unwrapped, it becomes
@@ -595,6 +563,8 @@ FeatureProp = namedtuple(
     ("enable_sparse_data_optim", "has_validation_col", "features_cols_names"),
 )
 
+_MODEL_CHUNK_SIZE = 4096 * 1024
+
 
 class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
     _input_kwargs: Dict[str, Any]
@@ -610,17 +580,17 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         self._setDefault(
             num_workers=1,
             device="cpu",
-            use_gpu=False,
             force_repartition=False,
             repartition_random_shuffle=False,
             feature_names=None,
             feature_types=None,
+            feature_weights=None,
             arbitrary_params_dict={},
         )
 
         self.logger = get_logger(self.__class__.__name__)
 
-    def setParams(self, **kwargs: Any) -> None:  # pylint: disable=invalid-name
+    def setParams(self, **kwargs: Any) -> None:
         """
         Set params for the estimator.
         """
@@ -678,8 +648,10 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         """
         raise NotImplementedError()
 
-    def _create_pyspark_model(self, xgb_model: XGBModel) -> "_SparkXGBModel":
-        return self._pyspark_model_cls()(xgb_model)
+    def _create_pyspark_model(
+        self, xgb_model: XGBModel, training_summary: XGBoostTrainingSummary
+    ) -> "_SparkXGBModel":
+        return self._pyspark_model_cls()(xgb_model, training_summary)
 
     def _convert_to_sklearn_model(self, booster: bytearray, config: str) -> XGBModel:
         xgb_sklearn_params = self._gen_xgb_params_dict(
@@ -690,50 +662,22 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         sklearn_model._Booster.load_config(config)
         return sklearn_model
 
-    def _query_plan_contains_valid_repartition(self, dataset: DataFrame) -> bool:
-        """
-        Returns true if the latest element in the logical plan is a valid repartition
-        The logic plan string format is like:
-
-        == Optimized Logical Plan ==
-        Repartition 4, true
-        +- LogicalRDD [features#12, label#13L], false
-
-        i.e., the top line in the logical plan is the last operation to execute.
-        so, in this method, we check the first line, if it is a "Repartition" operation,
-        and the result dataframe has the same partition number with num_workers param,
-        then it means the dataframe is well repartitioned and we don't need to
-        repartition the dataframe again.
-        """
-        num_partitions = dataset.rdd.getNumPartitions()
-        assert dataset._sc._jvm is not None
-        query_plan = dataset._sc._jvm.PythonSQLUtils.explainString(
-            dataset._jdf.queryExecution(), "extended"
-        )
-        start = query_plan.index("== Optimized Logical Plan ==")
-        start += len("== Optimized Logical Plan ==") + 1
-        num_workers = self.getOrDefault(self.num_workers)
-        if (
-            query_plan[start : start + len("Repartition")] == "Repartition"
-            and num_workers == num_partitions
-        ):
-            return True
-        return False
-
     def _repartition_needed(self, dataset: DataFrame) -> bool:
         """
         We repartition the dataset if the number of workers is not equal to the number of
-        partitions. There is also a check to make sure there was "active partitioning"
-        where either Round Robin or Hash partitioning was actively used before this stage.
-        """
+        partitions."""
         if self.getOrDefault(self.force_repartition):
             return True
-        try:
-            if self._query_plan_contains_valid_repartition(dataset):
-                return False
-        except Exception:  # pylint: disable=broad-except
-            pass
-        return True
+
+        # In Spark Connect, we cannot easily get the number of partitions.
+        # For now, since we cannot call rdd.getNumPartitions(), we just return
+        # True to ensure correct partitioning.
+        if _is_connect(dataset.sparkSession):
+            return True
+
+        num_workers = self.getOrDefault(self.num_workers)
+        num_partitions = dataset.rdd.getNumPartitions()
+        return not num_workers == num_partitions
 
     def _get_distributed_train_params(self, dataset: DataFrame) -> Dict[str, Any]:
         """
@@ -770,7 +714,7 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         cls, train_params: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         xgb_train_default_args = _get_default_params_from_func(
-            xgboost.train, _unsupported_train_params
+            worker_train, _unsupported_train_params
         )
         booster_params, kwargs_params = {}, {}
         for key, value in train_params.items():
@@ -814,16 +758,13 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
                 )
                 select_cols.append(features_array_col)
 
-        if self.isDefined(self.weightCol) and self.getOrDefault(self.weightCol) != "":
+        if self._col_is_defined_not_empty(self.weightCol):
             select_cols.append(
                 col(self.getOrDefault(self.weightCol)).alias(alias.weight)
             )
 
         has_validation_col = False
-        if (
-            self.isDefined(self.validationIndicatorCol)
-            and self.getOrDefault(self.validationIndicatorCol) != ""
-        ):
+        if self._col_is_defined_not_empty(self.validationIndicatorCol):
             select_cols.append(
                 col(self.getOrDefault(self.validationIndicatorCol)).alias(alias.valid)
             )
@@ -832,15 +773,12 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             # which will cause exception or hanging issue when creating DMatrix.
             has_validation_col = True
 
-        if (
-            self.isDefined(self.base_margin_col)
-            and self.getOrDefault(self.base_margin_col) != ""
-        ):
+        if self._col_is_defined_not_empty(self.base_margin_col):
             select_cols.append(
                 col(self.getOrDefault(self.base_margin_col)).alias(alias.margin)
             )
 
-        if self.isDefined(self.qid_col) and self.getOrDefault(self.qid_col) != "":
+        if self._col_is_defined_not_empty(self.qid_col):
             select_cols.append(col(self.getOrDefault(self.qid_col)).alias(alias.qid))
 
         feature_prop = FeatureProp(
@@ -858,8 +796,13 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         dataset = dataset.select(*select_cols)
 
         num_workers = self.getOrDefault(self.num_workers)
-        sc = _get_spark_session().sparkContext
-        max_concurrent_tasks = _get_max_num_concurrent_tasks(sc)
+        spark_session = dataset.sparkSession
+        max_concurrent_tasks = _get_max_num_concurrent_tasks(spark_session)
+
+        if feature_prop.has_validation_col:
+            dtype = dataset.schema[alias.valid].dataType
+            if not isinstance(dtype, BooleanType):
+                raise TypeError("The validation indicator must be boolean type.")
 
         if num_workers > max_concurrent_tasks:
             get_logger(self.__class__.__name__).warning(
@@ -870,22 +813,23 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
                 num_workers,
             )
 
-        if self._repartition_needed(dataset) or (
-            self.isDefined(self.validationIndicatorCol)
-            and self.getOrDefault(self.validationIndicatorCol) != ""
-        ):
-            # If validationIndicatorCol defined, we always repartition dataset
-            # to balance data, because user might unionise train and validation dataset,
-            # without shuffling data then some partitions might contain only train or validation
-            # dataset.
-            if self.getOrDefault(self.repartition_random_shuffle):
-                # In some cases, spark round-robin repartition might cause data skew
-                # use random shuffle can address it.
-                dataset = dataset.repartition(num_workers, rand(1))
+        if self._repartition_needed(dataset):
+            if self._col_is_defined_not_empty(self.qid_col):
+                # For ranking problem, we need to try best the put the instances with
+                # same group into the same partition
+                dataset = dataset.repartitionByRange(num_workers, alias.qid)
             else:
-                dataset = dataset.repartition(num_workers)
+                # If validationIndicatorCol defined, and if user unionise train and validation
+                # dataset, users must set force_repartition to true to force repartition.
+                # Or else some partitions might contain only train or validation dataset.
+                if self.getOrDefault(self.repartition_random_shuffle):
+                    # In some cases, spark round-robin repartition might cause data skew
+                    # use random shuffle can address it.
+                    dataset = dataset.repartition(num_workers, rand(1))
+                else:
+                    dataset = dataset.repartition(num_workers)
 
-        if self.isDefined(self.qid_col) and self.getOrDefault(self.qid_col) != "":
+        if self._col_is_defined_not_empty(self.qid_col):
             # XGBoost requires qid to be sorted for each partition
             dataset = dataset.sortWithinPartitions(alias.qid, ascending=True)
 
@@ -899,7 +843,7 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             train_params
         )
         cpu_per_task = int(
-            _get_spark_session().sparkContext.getConf().get("spark.task.cpus", "1")
+            dataset.sparkSession.conf.get("spark.task.cpus", None) or "1"
         )
 
         dmatrix_kwargs = {
@@ -922,31 +866,16 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
 
         return booster_params, train_call_kwargs_params, dmatrix_kwargs
 
-    def _skip_stage_level_scheduling(self, spark_version: str, conf: SparkConf) -> bool:
+    def _skip_stage_level_scheduling(self, spark_session: SparkSession) -> bool:
         # pylint: disable=too-many-return-statements
         """Check if stage-level scheduling is not needed,
         return true to skip stage-level scheduling"""
 
-        if self._run_on_gpu():
-            if spark_version < "3.4.0":
-                self.logger.info(
-                    "Stage-level scheduling in xgboost requires spark version 3.4.0+"
-                )
-                return True
-
-            if (
-                "3.4.0" <= spark_version < "3.5.1"
-                and not _is_standalone_or_localcluster(conf)
-            ):
-                self.logger.info(
-                    "For %s, Stage-level scheduling in xgboost requires spark standalone "
-                    "or local-cluster mode",
-                    spark_version,
-                )
-                return True
-
-            executor_cores = conf.get("spark.executor.cores")
-            executor_gpus = conf.get("spark.executor.resource.gpu.amount")
+        if self._run_on_gpu(spark_session):
+            executor_cores = spark_session.conf.get("spark.executor.cores", None)
+            executor_gpus = spark_session.conf.get(
+                "spark.executor.resource.gpu.amount", None
+            )
             if executor_cores is None or executor_gpus is None:
                 self.logger.info(
                     "Stage-level scheduling in xgboost requires spark.executor.cores, "
@@ -971,7 +900,9 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
                 )
                 return True
 
-            task_gpu_amount = conf.get("spark.task.resource.gpu.amount")
+            task_gpu_amount = spark_session.conf.get(
+                "spark.task.resource.gpu.amount", None
+            )
 
             if task_gpu_amount is None:
                 # The ETL tasks will not grab a gpu when spark.task.resource.gpu.amount is not set,
@@ -989,25 +920,26 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
         # CPU training doesn't require stage-level scheduling
         return True
 
-    def _try_stage_level_scheduling(self, rdd: RDD) -> RDD:
+    def _get_resource_profile_for_stage_level_scheduling(
+        self, spark_session: SparkSession
+    ) -> Optional[ResourceProfile]:
         """Try to enable stage-level scheduling"""
-        ss = _get_spark_session()
-        conf = ss.sparkContext.getConf()
-        if _is_local(ss.sparkContext) or self._skip_stage_level_scheduling(
-            ss.version, conf
-        ):
-            return rdd
+        conf = spark_session.conf
+        if _is_local(spark_session) or self._skip_stage_level_scheduling(spark_session):
+            return None
 
         # executor_cores will not be None
-        executor_cores = conf.get("spark.executor.cores")
+        executor_cores = conf.get("spark.executor.cores", None)
         assert executor_cores is not None
 
         # Spark-rapids is a project to leverage GPUs to accelerate spark SQL.
         # If spark-rapids is enabled, to avoid GPU OOM, we don't allow other
         # ETL gpu tasks running alongside training tasks.
-        spark_plugins = ss.conf.get("spark.plugins", " ")
+        spark_plugins = spark_session.conf.get("spark.plugins", " ")
         assert spark_plugins is not None
-        spark_rapids_sql_enabled = ss.conf.get("spark.rapids.sql.enabled", "true")
+        spark_rapids_sql_enabled = spark_session.conf.get(
+            "spark.rapids.sql.enabled", "true"
+        )
         assert spark_rapids_sql_enabled is not None
 
         task_cores = (
@@ -1032,11 +964,42 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             task_cores,
             task_gpus,
         )
-        return rdd.withResources(rp)
+        return rp
+
+    def _get_tracker_args(
+        self, spark_session: SparkSession
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Start the tracker and return the tracker envs on the driver side"""
+        if self.isDefined(self.launch_tracker_on_driver):
+            launch_tracker_on_driver = self.getOrDefault(self.launch_tracker_on_driver)
+        else:
+            launch_tracker_on_driver = not _is_connect(spark_session)
+
+        rabit_args = {}
+        if launch_tracker_on_driver:
+            conf = Config()
+            if self.isDefined(self.coll_cfg):
+                conf = self.getOrDefault(self.coll_cfg)
+                assert isinstance(conf, Config)
+
+            if conf.tracker_host_ip is None:
+                conf.tracker_host_ip = spark_session.conf.get("spark.driver.host", None)
+            num_workers = self.getOrDefault(self.num_workers)
+            rabit_args.update(_get_rabit_args(conf, num_workers))
+        else:
+            if self.isDefined(self.coll_cfg):
+                conf = self.getOrDefault(self.coll_cfg)
+                assert isinstance(conf, Config)
+                if conf.tracker_host_ip is not None:
+                    raise ValueError(
+                        f"You must enable launch_tracker_on_driver to use "
+                        f"tracker host: {conf.tracker_host_ip}"
+                    )
+        return launch_tracker_on_driver, rabit_args
 
     def _fit(self, dataset: DataFrame) -> "_SparkXGBModel":
         # pylint: disable=too-many-statements, too-many-locals
-        self._validate_params()
+        self._validate_params(dataset.sparkSession)
 
         dataset, feature_prop = self._prepare_input(dataset)
 
@@ -1046,13 +1009,22 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             dmatrix_kwargs,
         ) = self._get_xgb_parameters(dataset)
 
-        run_on_gpu = self._run_on_gpu()
+        run_on_gpu = self._run_on_gpu(dataset.sparkSession)
 
-        is_local = _is_local(_get_spark_session().sparkContext)
+        is_local = _is_local(dataset.sparkSession)
 
         num_workers = self.getOrDefault(self.num_workers)
 
+        launch_tracker_on_driver, rabit_args = self._get_tracker_args(
+            dataset.sparkSession
+        )
+        conf: Optional[Config] = (
+            self.getOrDefault(self.coll_cfg) if self.isDefined(self.coll_cfg) else None
+        )
+
         log_level = get_logger_level(_LOG_TAG)
+
+        use_rmm = get_config()["use_rmm"]
 
         def _train_booster(
             pandas_df_iter: Iterator[pd.DataFrame],
@@ -1064,9 +1036,13 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             from pyspark import BarrierTaskContext
 
             context = BarrierTaskContext.get()
+            context.barrier()
 
             dev_ordinal = None
-            use_qdm = _can_use_qdm(booster_params.get("tree_method", None))
+            use_qdm = _can_use_qdm(
+                booster_params.get("tree_method", None),
+                booster_params.get("device", None),
+            )
             verbosity = booster_params.get("verbosity", 1)
             msg = "Training on CPUs"
             if run_on_gpu:
@@ -1086,39 +1062,49 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
 
             if use_qdm and (booster_params.get("max_bin", None) is not None):
                 dmatrix_kwargs["max_bin"] = booster_params["max_bin"]
-
-            _rabit_args = {}
+            _rabit_args = rabit_args
             if context.partitionId() == 0:
-                _rabit_args = _get_rabit_args(context, num_workers)
+                if not launch_tracker_on_driver:
+                    _conf = conf if conf is not None else Config()
+                    _conf.tracker_host_ip = _get_host_ip(context)
+                    _rabit_args = _get_rabit_args(_conf, num_workers)
                 get_logger(_LOG_TAG, log_level).info(msg)
 
-            worker_message = {
-                "rabit_msg": _rabit_args,
+            worker_message: Dict[str, Any] = {
                 "use_qdm": use_qdm,
             }
+
+            if not launch_tracker_on_driver:
+                worker_message["rabit_msg"] = _rabit_args
 
             messages = context.allGather(message=json.dumps(worker_message))
             if len(set(json.loads(x)["use_qdm"] for x in messages)) != 1:
                 raise RuntimeError("The workers' cudf environments are in-consistent ")
 
-            _rabit_args = json.loads(messages[0])["rabit_msg"]
+            if not launch_tracker_on_driver:
+                _rabit_args = json.loads(messages[0])["rabit_msg"]
+
+            if conf is not None:
+                _rabit_args = conf.update_worker_args(_rabit_args)
 
             evals_result: Dict[str, Any] = {}
-            with CommunicatorContext(context, **_rabit_args):
-                with xgboost.config_context(verbosity=verbosity):
-                    dtrain, dvalid = create_dmatrix_from_partitions(
-                        pandas_df_iter,
-                        feature_prop.features_cols_names,
-                        dev_ordinal,
-                        use_qdm,
-                        dmatrix_kwargs,
-                        enable_sparse_data_optim=feature_prop.enable_sparse_data_optim,
-                        has_validation_col=feature_prop.has_validation_col,
-                    )
+            with (
+                config_context(verbosity=verbosity, use_rmm=use_rmm),
+                CommunicatorContext(context, **_rabit_args),
+            ):
+                dtrain, dvalid = create_dmatrix_from_partitions(
+                    iterator=pandas_df_iter,
+                    feature_cols=feature_prop.features_cols_names,
+                    dev_ordinal=dev_ordinal,
+                    use_qdm=use_qdm,
+                    kwargs=dmatrix_kwargs,
+                    enable_sparse_data_optim=feature_prop.enable_sparse_data_optim,
+                    has_validation_col=feature_prop.has_validation_col,
+                )
                 if dvalid is not None:
                     dval = [(dtrain, "training"), (dvalid, "validation")]
                 else:
-                    dval = None
+                    dval = [(dtrain, "training")]
                 booster = worker_train(
                     params=booster_params,
                     dtrain=dtrain,
@@ -1129,44 +1115,47 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
             context.barrier()
 
             if context.partitionId() == 0:
-                yield pd.DataFrame(
-                    data={
-                        "config": [booster.save_config()],
-                        "booster": [booster.save_raw("json").decode("utf-8")],
-                    }
-                )
+                yield pd.DataFrame({"data": [json.dumps(dict(evals_result))]})
+                config = booster.save_config()
+                yield pd.DataFrame({"data": [config]})
+                booster_json = booster.save_raw("json").decode("utf-8")
 
-        def _run_job() -> Tuple[str, str]:
-            rdd = (
-                dataset.mapInPandas(
-                    _train_booster,  # type: ignore
-                    schema="config string, booster string",
-                )
-                .rdd.barrier()
-                .mapPartitions(lambda x: x)
+                for offset in range(0, len(booster_json), _MODEL_CHUNK_SIZE):
+                    booster_chunk = booster_json[offset : offset + _MODEL_CHUNK_SIZE]
+                    yield pd.DataFrame({"data": [booster_chunk]})
+
+        def _run_job() -> Tuple[str, str, str]:
+            df = dataset.mapInPandas(
+                _train_booster,  # type: ignore[arg-type]
+                schema="data string",
+                barrier=True,
+                profile=self._get_resource_profile_for_stage_level_scheduling(
+                    dataset.sparkSession
+                ),
             )
-            rdd_with_resource = self._try_stage_level_scheduling(rdd)
-            ret = rdd_with_resource.collect()[0]
-            return ret[0], ret[1]
+            ret = df.collect()
+            data = [row.data for row in ret]
+            return data[0], data[1], "".join(data[2:])
 
         get_logger(_LOG_TAG).info(
             "Running xgboost-%s on %s workers with"
             "\n\tbooster params: %s"
             "\n\ttrain_call_kwargs_params: %s"
             "\n\tdmatrix_kwargs: %s",
-            xgboost._py_version(),
+            _py_version(),
             num_workers,
             booster_params,
             train_call_kwargs_params,
             dmatrix_kwargs,
         )
-        (config, booster) = _run_job()
+        evals_result, config, booster = _run_job()
         get_logger(_LOG_TAG).info("Finished xgboost training!")
 
         result_xgb_model = self._convert_to_sklearn_model(
             bytearray(booster, "utf-8"), config
         )
-        spark_model = self._create_pyspark_model(result_xgb_model)
+        training_summary = XGBoostTrainingSummary.from_metrics(json.loads(evals_result))
+        spark_model = self._create_pyspark_model(result_xgb_model, training_summary)
         # According to pyspark ML convention, the model uid should be the same
         # with estimator uid.
         spark_model._resetUid(self.uid)
@@ -1187,9 +1176,14 @@ class _SparkXGBEstimator(Estimator, _SparkXGBParams, MLReadable, MLWritable):
 
 
 class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
-    def __init__(self, xgb_sklearn_model: Optional[XGBModel] = None) -> None:
+    def __init__(
+        self,
+        xgb_sklearn_model: Optional[XGBModel] = None,
+        training_summary: Optional[XGBoostTrainingSummary] = None,
+    ) -> None:
         super().__init__()
         self._xgb_sklearn_model = xgb_sklearn_model
+        self.training_summary = training_summary
 
     @classmethod
     def _xgb_cls(cls) -> Type[XGBModel]:
@@ -1273,10 +1267,7 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
     def _get_pred_contrib_col_name(self) -> Optional[str]:
         """Return the pred_contrib_col col name"""
         pred_contrib_col_name = None
-        if (
-            self.isDefined(self.pred_contrib_col)
-            and self.getOrDefault(self.pred_contrib_col) != ""
-        ):
+        if self._col_is_defined_not_empty(self.pred_contrib_col):
             pred_contrib_col_name = self.getOrDefault(self.pred_contrib_col)
 
         return pred_contrib_col_name
@@ -1345,28 +1336,23 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
             dataset = dataset.drop(pred_struct_col)
         return dataset
 
-    def _run_on_gpu(self) -> bool:
+    def _run_on_gpu(self, spark_session: SparkSession) -> bool:
         """If gpu is used to do the prediction according to the parameters
         and spark configurations"""
 
-        use_gpu_by_params = super()._run_on_gpu()
+        use_gpu_by_params = super()._run_on_gpu(spark_session)
 
-        if _is_local(_get_spark_session().sparkContext):
+        if _is_local(spark_session):
             # if it's local model, no need to check the spark configurations
             return use_gpu_by_params
 
-        gpu_per_task = (
-            _get_spark_session()
-            .sparkContext.getConf()
-            .get("spark.task.resource.gpu.amount")
-        )
+        gpu_per_task = spark_session.conf.get("spark.task.resource.gpu.amount", None)
 
         # User don't set gpu configurations, just use cpu
         if gpu_per_task is None:
             if use_gpu_by_params:
                 get_logger(_LOG_TAG).warning(
-                    "Do the prediction on the CPUs since "
-                    "no gpu configurations are set"
+                    "Do the prediction on the CPUs since no gpu configurations are set"
                 )
             return False
 
@@ -1379,15 +1365,12 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
         # to avoid the `self` object to be pickled to remote.
         xgb_sklearn_model = self._xgb_sklearn_model
 
-        has_base_margin = False
-        if (
-            self.isDefined(self.base_margin_col)
-            and self.getOrDefault(self.base_margin_col) != ""
-        ):
-            has_base_margin = True
+        base_margin_col = None
+        if self._col_is_defined_not_empty(self.base_margin_col):
             base_margin_col = col(self.getOrDefault(self.base_margin_col)).alias(
                 alias.margin
             )
+        has_base_margin = base_margin_col is not None
 
         features_col, feature_col_names = self._get_feature_col(dataset)
         enable_sparse_data_optim = self.getOrDefault(self.enable_sparse_data_optim)
@@ -1396,12 +1379,12 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
 
         _, schema = self._out_schema()
 
-        is_local = _is_local(_get_spark_session().sparkContext)
-        run_on_gpu = self._run_on_gpu()
+        is_local = _is_local(dataset.sparkSession)
+        run_on_gpu = self._run_on_gpu(dataset.sparkSession)
 
         log_level = get_logger_level(_LOG_TAG)
 
-        @pandas_udf(schema)  # type: ignore
+        @pandas_udf(schema)  # type: ignore[call-overload]
         def predict_udf(iterator: Iterator[pd.DataFrame]) -> Iterator[pd.Series]:
             assert xgb_sklearn_model is not None
             model = xgb_sklearn_model
@@ -1417,7 +1400,7 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
             if run_on_gpu:
                 if is_cudf_available() and is_cupy_available():
                     if is_local:
-                        import cupy as cp  # pylint: disable=import-error
+                        cp = import_cupy()
 
                         total_gpus = cp.cuda.runtime.getDeviceCount()
                         if total_gpus > 0:
@@ -1443,8 +1426,8 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
             def to_gpu_if_possible(data: ArrayLike) -> ArrayLike:
                 """Move the data to gpu if possible"""
                 if dev_ordinal >= 0:
-                    import cudf  # pylint: disable=import-error
-                    import cupy as cp  # pylint: disable=import-error
+                    import cudf
+                    import cupy as cp
 
                     # We must set the device after import cudf, which will change the device id to 0
                     # See https://github.com/rapidsai/cudf/issues/11386
@@ -1459,7 +1442,7 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
                     X = _read_csr_matrix_from_unwrapped_spark_vec(data)
                 else:
                     if feature_col_names is not None:
-                        tmp = data[feature_col_names]
+                        tmp: ArrayLike = data[feature_col_names]
                     else:
                         tmp = stack_series(data[alias.data])
                     X = to_gpu_if_possible(tmp)
@@ -1472,6 +1455,7 @@ class _SparkXGBModel(Model, _SparkXGBParams, MLReadable, MLWritable):
                 yield predict_func(model, X, base_margin)
 
         if has_base_margin:
+            assert base_margin_col is not None
             pred_col = predict_udf(struct(*features_col, base_margin_col))
         else:
             pred_col = predict_udf(struct(*features_col))
@@ -1585,7 +1569,7 @@ class _SparkXGBSharedReadWrite:
     def saveMetadata(
         instance: Union[_SparkXGBEstimator, _SparkXGBModel],
         path: str,
-        sc: SparkContext,
+        spark_session: SparkSession,
         logger: logging.Logger,
         extraMetadata: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -1593,8 +1577,8 @@ class _SparkXGBSharedReadWrite:
         Save the metadata of an xgboost.spark._SparkXGBEstimator or
         xgboost.spark._SparkXGBModel.
         """
-        instance._validate_params()
-        skipParams = ["callbacks", "xgb_model"]
+        instance._validate_params(spark_session)
+        skipParams = ["callbacks", "xgb_model", "coll_cfg"]
         jsonParams = {}
         for p, v in instance._paramMap.items():  # pylint: disable=protected-access
             if p.name not in skipParams:
@@ -1615,13 +1599,27 @@ class _SparkXGBSharedReadWrite:
         init_booster = instance.getOrDefault("xgb_model")
         if init_booster is not None:
             extraMetadata["init_booster"] = _INIT_BOOSTER_SAVE_PATH
+
+        if instance.isDefined("coll_cfg"):
+            conf: Config = instance.getOrDefault("coll_cfg")
+            if conf is not None:
+                extraMetadata["coll_cfg"] = {
+                    k: v for k, v in asdict(conf).items() if not callable(v)
+                }
+            if callable(conf.worker_port):
+                logger.warning("The `worker_port` is not serialized.")
+
         DefaultParamsWriter.saveMetadata(
-            instance, path, sc, extraMetadata=extraMetadata, paramMap=jsonParams
+            instance,
+            path,
+            spark_session if _is_connect(spark_session) else spark_session.sparkContext,
+            extraMetadata=extraMetadata,
+            paramMap=jsonParams,
         )
         if init_booster is not None:
             ser_init_booster = serialize_booster(init_booster)
             save_path = os.path.join(path, _INIT_BOOSTER_SAVE_PATH)
-            _get_spark_session().createDataFrame(
+            spark_session.createDataFrame(
                 [(ser_init_booster,)], ["init_booster"]
             ).write.parquet(save_path)
 
@@ -1629,7 +1627,7 @@ class _SparkXGBSharedReadWrite:
     def loadMetadataAndInstance(
         pyspark_xgb_cls: Union[Type[_SparkXGBEstimator], Type[_SparkXGBModel]],
         path: str,
-        sc: SparkContext,
+        spark_session: SparkSession,
         logger: logging.Logger,
     ) -> Tuple[Dict[str, Any], Union[_SparkXGBEstimator, _SparkXGBModel]]:
         """
@@ -1639,7 +1637,9 @@ class _SparkXGBSharedReadWrite:
         :return: a tuple of (metadata, instance)
         """
         metadata = DefaultParamsReader.loadMetadata(
-            path, sc, expectedClassName=get_class_name(pyspark_xgb_cls)
+            path,
+            spark_session if _is_connect(spark_session) else spark_session.sparkContext,
+            expectedClassName=get_class_name(pyspark_xgb_cls),
         )
         pyspark_xgb = pyspark_xgb_cls()
         DefaultParamsReader.getAndSetParams(pyspark_xgb, metadata)
@@ -1650,20 +1650,22 @@ class _SparkXGBSharedReadWrite:
                 callbacks = cloudpickle.loads(
                     base64.decodebytes(serialized_callbacks.encode("ascii"))
                 )
-                pyspark_xgb.set(pyspark_xgb.callbacks, callbacks)  # type: ignore
+                pyspark_xgb.set(pyspark_xgb.callbacks, callbacks)  # type: ignore[union-attr]
             except Exception as e:  # pylint: disable=W0703
                 logger.warning(
                     f"Fails to load the callbacks param due to {e}. Please set the "
                     "callbacks param manually for the loaded estimator."
                 )
+        if "coll_cfg" in metadata:
+            pyspark_xgb.set_coll_cfg(Config(**metadata["coll_cfg"]))
 
         if "init_booster" in metadata:
             load_path = os.path.join(path, metadata["init_booster"])
             ser_init_booster = (
-                _get_spark_session().read.parquet(load_path).collect()[0].init_booster
+                spark_session.read.parquet(load_path).collect()[0].init_booster
             )
             init_booster = deserialize_booster(ser_init_booster)
-            pyspark_xgb.set(pyspark_xgb.xgb_model, init_booster)  # type: ignore
+            pyspark_xgb.set(pyspark_xgb.xgb_model, init_booster)  # type: ignore[union-attr]
 
         pyspark_xgb._resetUid(metadata["uid"])  # pylint: disable=protected-access
         return metadata, pyspark_xgb
@@ -1683,7 +1685,9 @@ class SparkXGBWriter(MLWriter):
         """
         save model.
         """
-        _SparkXGBSharedReadWrite.saveMetadata(self.instance, path, self.sc, self.logger)
+        _SparkXGBSharedReadWrite.saveMetadata(
+            self.instance, path, self.sparkSession, self.logger
+        )
 
 
 class SparkXGBReader(MLReader):
@@ -1701,7 +1705,7 @@ class SparkXGBReader(MLReader):
         load model.
         """
         _, pyspark_xgb = _SparkXGBSharedReadWrite.loadMetadataAndInstance(
-            self.cls, path, self.sc, self.logger
+            self.cls, path, self.sparkSession, self.logger
         )
         return cast("_SparkXGBEstimator", pyspark_xgb)
 
@@ -1724,11 +1728,24 @@ class SparkXGBModelWriter(MLWriter):
         """
         xgb_model = self.instance._xgb_sklearn_model
         assert xgb_model is not None
-        _SparkXGBSharedReadWrite.saveMetadata(self.instance, path, self.sc, self.logger)
+        _SparkXGBSharedReadWrite.saveMetadata(
+            self.instance, path, self.sparkSession, self.logger
+        )
         model_save_path = os.path.join(path, "model")
         booster = xgb_model.get_booster().save_raw("json").decode("utf-8")
-        _get_spark_session().sparkContext.parallelize([booster], 1).saveAsTextFile(
-            model_save_path
+        booster_chunks = []
+
+        for offset in range(0, len(booster), _MODEL_CHUNK_SIZE):
+            booster_chunks.append(booster[offset : offset + _MODEL_CHUNK_SIZE])
+
+        # Write model preserving row ordering
+        indexed_chunks = [[i, c] for i, c in enumerate(booster_chunks)]
+        (
+            self.sparkSession.createDataFrame(indexed_chunks, ["idx", "value"])
+            .repartition(1)
+            .sortWithinPartitions("idx")
+            .select("value")
+            .write.text(model_save_path)
         )
 
 
@@ -1749,7 +1766,7 @@ class SparkXGBModelReader(MLReader):
         :return: SparkXGBRegressorModel or SparkXGBClassifierModel instance
         """
         _, py_model = _SparkXGBSharedReadWrite.loadMetadataAndInstance(
-            self.cls, path, self.sc, self.logger
+            self.cls, path, self.sparkSession, self.logger
         )
         py_model = cast("_SparkXGBModel", py_model)
 
@@ -1758,8 +1775,8 @@ class SparkXGBModelReader(MLReader):
         )
         model_load_path = os.path.join(path, "model")
 
-        ser_xgb_model = (
-            _get_spark_session().sparkContext.textFile(model_load_path).collect()[0]
+        ser_xgb_model = "".join(
+            [r[0] for r in self.sparkSession.read.text(model_load_path).collect()]
         )
 
         def create_xgb_model() -> "XGBModel":

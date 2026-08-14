@@ -1,11 +1,14 @@
-// Copyright by Contributors
+/**
+ * Copyright 2018-2026, XGBoost Contributors
+ */
 #include <gtest/gtest.h>
+
+#include <stack>  // for stack
 
 #include "../../../src/common/bitfield.h"
 #include "../../../src/common/categorical.h"
-#include "../filesystem.h"
+#include "../../../src/tree/io_utils.h"  // for DftBadValue
 #include "../helpers.h"
-#include "xgboost/json_io.h"
 #include "xgboost/tree_model.h"
 
 namespace xgboost {
@@ -14,20 +17,6 @@ TEST(Tree, ModelShape) {
   RegTree tree{1u, n_features};
   ASSERT_EQ(tree.NumFeatures(), n_features);
 
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/tree.model";
-  {
-    // binary dump
-    std::unique_ptr<dmlc::Stream> fo(dmlc::Stream::Create(tmp_file.c_str(), "w"));
-    tree.Save(fo.get());
-  }
-  {
-    // binary load
-    RegTree new_tree;
-    std::unique_ptr<dmlc::Stream> fi(dmlc::Stream::Create(tmp_file.c_str(), "r"));
-    new_tree.Load(fi.get());
-    ASSERT_EQ(new_tree.NumFeatures(), n_features);
-  }
   {
     // json
     Json j_tree{Object{}};
@@ -54,88 +43,6 @@ TEST(Tree, ModelShape) {
   }
 }
 
-#if DMLC_IO_NO_ENDIAN_SWAP  // skip on big-endian machines
-// Manually construct tree in binary format
-// Do not use structs in case they change
-// We want to preserve backwards compatibility
-TEST(Tree, Load) {
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/tree.model";
-  std::unique_ptr<dmlc::Stream> fo(dmlc::Stream::Create(tmp_file.c_str(), "w"));
-
-  // Write params
-  EXPECT_EQ(sizeof(TreeParam), (31 + 6) * sizeof(int));
-  int num_roots = 1;
-  int num_nodes = 2;
-  int num_deleted = 0;
-  int max_depth = 1;
-  int num_feature = 0;
-  int size_leaf_vector = 0;
-  int reserved[31];
-  fo->Write(&num_roots, sizeof(int));
-  fo->Write(&num_nodes, sizeof(int));
-  fo->Write(&num_deleted, sizeof(int));
-  fo->Write(&max_depth, sizeof(int));
-  fo->Write(&num_feature, sizeof(int));
-  fo->Write(&size_leaf_vector, sizeof(int));
-  fo->Write(reserved, sizeof(int) * 31);
-
-  // Write 2 nodes
-  EXPECT_EQ(sizeof(RegTree::Node),
-            3 * sizeof(int) + 1 * sizeof(unsigned) + sizeof(float));
-  int parent = -1;
-  int cleft = 1;
-  int cright = -1;
-  unsigned sindex = 5;
-  float split_or_weight = 0.5;
-  fo->Write(&parent, sizeof(int));
-  fo->Write(&cleft, sizeof(int));
-  fo->Write(&cright, sizeof(int));
-  fo->Write(&sindex, sizeof(unsigned));
-  fo->Write(&split_or_weight, sizeof(float));
-  parent = 0;
-  cleft = -1;
-  cright = -1;
-  sindex = 2;
-  split_or_weight = 0.1;
-  fo->Write(&parent, sizeof(int));
-  fo->Write(&cleft, sizeof(int));
-  fo->Write(&cright, sizeof(int));
-  fo->Write(&sindex, sizeof(unsigned));
-  fo->Write(&split_or_weight, sizeof(float));
-
-  // Write 2x node stats
-  EXPECT_EQ(sizeof(RTreeNodeStat), 3 * sizeof(float) + sizeof(int));
-  bst_float loss_chg = 5.0;
-  bst_float sum_hess = 1.0;
-  bst_float base_weight = 3.0;
-  int leaf_child_cnt = 0;
-  fo->Write(&loss_chg, sizeof(float));
-  fo->Write(&sum_hess, sizeof(float));
-  fo->Write(&base_weight, sizeof(float));
-  fo->Write(&leaf_child_cnt, sizeof(int));
-
-  loss_chg = 50.0;
-  sum_hess = 10.0;
-  base_weight = 30.0;
-  leaf_child_cnt = 0;
-  fo->Write(&loss_chg, sizeof(float));
-  fo->Write(&sum_hess, sizeof(float));
-  fo->Write(&base_weight, sizeof(float));
-  fo->Write(&leaf_child_cnt, sizeof(int));
-  fo.reset();
-  std::unique_ptr<dmlc::Stream> fi(dmlc::Stream::Create(tmp_file.c_str(), "r"));
-
-  xgboost::RegTree tree;
-  tree.Load(fi.get());
-  EXPECT_EQ(tree.GetDepth(1), 1);
-  EXPECT_EQ(tree[0].SplitCond(), 0.5f);
-  EXPECT_EQ(tree[0].SplitIndex(), 5ul);
-  EXPECT_EQ(tree[1].LeafValue(), 0.1f);
-  EXPECT_TRUE(tree[1].IsLeaf());
-}
-#endif  // DMLC_IO_NO_ENDIAN_SWAP
-
 TEST(Tree, AllocateNode) {
   RegTree tree;
   tree.ExpandNode(0, 0, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
@@ -147,35 +54,36 @@ TEST(Tree, AllocateNode) {
                   /*left_sum=*/0.0f, /*right_sum=*/0.0f);
   ASSERT_EQ(tree.NumExtraNodes(), 2);
 
-  auto& nodes = tree.GetNodes();
-  ASSERT_FALSE(nodes.at(1).IsDeleted());
-  ASSERT_TRUE(nodes.at(1).IsLeaf());
-  ASSERT_TRUE(nodes.at(2).IsLeaf());
+  auto nodes = tree.GetNodes(DeviceOrd::CPU());
+  ASSERT_FALSE(nodes[1].IsDeleted());
+  ASSERT_TRUE(nodes[1].IsLeaf());
+  ASSERT_TRUE(nodes[2].IsLeaf());
 }
 
 TEST(Tree, ExpandCategoricalFeature) {
+  Context ctx;
   {
     RegTree tree;
     tree.ExpandCategorical(0, 0, {}, true, 1.0, 2.0, 3.0, 11.0, 2.0,
                            /*left_sum=*/3.0, /*right_sum=*/4.0);
-    ASSERT_EQ(tree.GetNodes().size(), 3ul);
+    ASSERT_EQ(tree.Size(), 3ul);
     ASSERT_EQ(tree.GetNumLeaves(), 2);
-    ASSERT_EQ(tree.GetSplitTypes().size(), 3ul);
-    ASSERT_EQ(tree.GetSplitTypes()[0], FeatureType::kCategorical);
-    ASSERT_EQ(tree.GetSplitTypes()[1], FeatureType::kNumerical);
-    ASSERT_EQ(tree.GetSplitTypes()[2], FeatureType::kNumerical);
-    ASSERT_EQ(tree.GetSplitCategories().size(), 0ul);
-    ASSERT_TRUE(std::isnan(tree[0].SplitCond()));
+    ASSERT_EQ(tree.GetSplitTypes(ctx.Device()).size(), 3ul);
+    ASSERT_EQ(tree.GetSplitTypes(ctx.Device())[0], FeatureType::kCategorical);
+    ASSERT_EQ(tree.GetSplitTypes(ctx.Device())[1], FeatureType::kNumerical);
+    ASSERT_EQ(tree.GetSplitTypes(ctx.Device())[2], FeatureType::kNumerical);
+    ASSERT_EQ(tree.GetSplitCategories(ctx.Device()).size(), 0ul);
+    ASSERT_EQ(tree[0].SplitCond(), DftBadValue());
   }
   {
     RegTree tree;
     bst_cat_t cat = 33;
-    std::vector<uint32_t> split_cats(LBitField32::ComputeStorageSize(cat+1));
-    LBitField32 bitset {split_cats};
+    std::vector<uint32_t> split_cats(LBitField32::ComputeStorageSize(cat + 1));
+    LBitField32 bitset{split_cats};
     bitset.Set(cat);
     tree.ExpandCategorical(0, 0, split_cats, true, 1.0, 2.0, 3.0, 11.0, 2.0,
                            /*left_sum=*/3.0, /*right_sum=*/4.0);
-    auto categories = tree.GetSplitCategories();
+    auto categories = tree.GetSplitCategories(ctx.Device());
     auto segments = tree.GetSplitCategoriesPtr();
     auto got = categories.subspan(segments[0].beg, segments[0].size);
     ASSERT_TRUE(std::equal(got.cbegin(), got.cend(), split_cats.cbegin()));
@@ -191,7 +99,7 @@ TEST(Tree, ExpandCategoricalFeature) {
     ASSERT_EQ(cat_ptr[0].beg, 0ul);
     ASSERT_EQ(cat_ptr[0].size, 2ul);
 
-    auto loaded_categories = loaded_tree.GetSplitCategories();
+    auto loaded_categories = loaded_tree.GetSplitCategories(ctx.Device());
     auto loaded_root = loaded_categories.subspan(cat_ptr[0].beg, cat_ptr[0].size);
     ASSERT_TRUE(std::equal(loaded_root.begin(), loaded_root.end(), split_cats.begin()));
   }
@@ -218,8 +126,7 @@ void GrowTree(RegTree* p_tree) {
     bst_feature_t f = feat(&lcg);
     if (is_cat) {
       bst_cat_t cat = common::AsCat(split_cat(&lcg));
-      std::vector<uint32_t> split_cats(
-          LBitField32::ComputeStorageSize(cat + 1));
+      std::vector<uint32_t> split_cats(LBitField32::ComputeStorageSize(cat + 1));
       LBitField32 bitset{split_cats};
       bitset.Set(cat);
       tree.ExpandCategorical(node, f, split_cats, true, 1.0, 2.0, 3.0, 11.0, 2.0,
@@ -235,7 +142,7 @@ void GrowTree(RegTree* p_tree) {
   }
 }
 
-void CheckReload(RegTree const &tree) {
+void CheckReload(RegTree const& tree) {
   Json out{Object()};
   tree.SaveModel(&out);
 
@@ -299,16 +206,16 @@ RegTree ConstructTreeCat(std::vector<bst_cat_t>* cond) {
   cond->push_back(14);
   cond->push_back(32);
 
-  tree.ExpandCategorical(0, /*split_index=*/0, cats_storage, true, 0.0f, 2.0,
-                         3.00, 11.0, 2.0, 3.0, 4.0);
+  tree.ExpandCategorical(0, /*split_index=*/0, cats_storage, true, 0.0f, 2.0, 3.00, 11.0, 2.0, 3.0,
+                         4.0);
   auto left = tree[0].LeftChild();
   auto right = tree[0].RightChild();
   tree.ExpandNode(
       /*nid=*/left, /*split_index=*/1, /*split_value=*/1.0f,
       /*default_left=*/false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, /*left_sum=*/0.0f,
       /*right_sum=*/0.0f);
-  tree.ExpandCategorical(right, /*split_index=*/0, cats_storage, true, 0.0f,
-                         2.0, 3.00, 11.0, 2.0, 3.0, 4.0);
+  tree.ExpandCategorical(right, /*split_index=*/0, cats_storage, true, 0.0f, 2.0, 3.00, 11.0, 2.0,
+                         3.0, 4.0);
   return tree;
 }
 
@@ -339,6 +246,7 @@ void TestCategoricalTreeDump(std::string format, std::string sep) {
   ASSERT_NE(pos, std::string::npos);
   pos = str.find(cond_str, pos + 1);
   ASSERT_NE(pos, std::string::npos);
+  ASSERT_NE(str.find("gain"), std::string::npos);
 
   if (format == "json") {
     // Make sure it's valid JSON
@@ -377,14 +285,11 @@ TEST(Tree, DumpJson) {
   str = tree.DumpModel(fmap, false, "json");
   ASSERT_EQ(str.find("cover"), std::string::npos);
 
-
   auto j_tree = Json::Load({str.c_str(), str.size()});
   ASSERT_EQ(get<Array>(j_tree["children"]).size(), 2ul);
 }
 
-TEST(Tree, DumpJsonCategorical) {
-  TestCategoricalTreeDump("json", ", ");
-}
+TEST(Tree, DumpJsonCategorical) { TestCategoricalTreeDump("json", ", "); }
 
 TEST(Tree, DumpText) {
   auto tree = ConstructTree();
@@ -421,9 +326,7 @@ TEST(Tree, DumpText) {
   ASSERT_EQ(str.find("cover"), std::string::npos);
 }
 
-TEST(Tree, DumpTextCategorical) {
-  TestCategoricalTreeDump("text", ",");
-}
+TEST(Tree, DumpTextCategorical) { TestCategoricalTreeDump("text", ","); }
 
 TEST(Tree, DumpDot) {
   auto tree = ConstructTree();
@@ -449,7 +352,8 @@ TEST(Tree, DumpDot) {
   fmap.PushBack(2, "feat_2", "int");
 
   str = tree.DumpModel(fmap, true, "dot");
-  ASSERT_NE(str.find(R"("feat_0")"), std::string::npos);
+  ASSERT_NE(str.find(R"("feat_0)"), std::string::npos);
+  ASSERT_EQ(str.find(R"("feat_0")"), std::string::npos);  // newline
   ASSERT_NE(str.find(R"(feat_1<1)"), std::string::npos);
   ASSERT_NE(str.find(R"(feat_2<2)"), std::string::npos);
 
@@ -462,9 +366,7 @@ TEST(Tree, DumpDot) {
   ASSERT_NE(str.find(R"(1 -> 4 [label="no, missing")"), std::string::npos);
 }
 
-TEST(Tree, DumpDotCategorical) {
-  TestCategoricalTreeDump("dot", ",");
-}
+TEST(Tree, DumpDotCategorical) { TestCategoricalTreeDump("dot", ","); }
 
 TEST(Tree, JsonIO) {
   RegTree tree;
@@ -488,7 +390,7 @@ TEST(Tree, JsonIO) {
   RegTree loaded_tree;
   loaded_tree.LoadModel(j_tree);
   ASSERT_EQ(loaded_tree.NumNodes(), 3);
-  ASSERT_TRUE(loaded_tree == tree);
+  ASSERT_TRUE(loaded_tree.Equal(tree));
 
   auto left = tree[0].LeftChild();
   auto right = tree[0].RightChild();

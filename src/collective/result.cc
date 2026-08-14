@@ -1,5 +1,5 @@
 /**
- *  Copyright 2024, XGBoost Contributors
+ *  Copyright 2024-2025, XGBoost Contributors
  */
 #include "xgboost/collective/result.h"
 
@@ -62,25 +62,30 @@ void ResultImpl::Concat(std::unique_ptr<ResultImpl> rhs) {
   ptr->prev = std::move(rhs);
 }
 
-#if (!defined(__GNUC__) && !defined(__clang__)) || defined(__MINGW32__)
-std::string MakeMsg(std::string&& msg, char const*, std::int32_t) {
-  return std::forward<std::string>(msg);
-}
-#else
 std::string MakeMsg(std::string&& msg, char const* file, std::int32_t line) {
-  auto name = std::filesystem::path{file}.filename();
+  dmlc::DateLogger logger;
   if (file && line != -1) {
-    return "[" + name.string() + ":" + std::to_string(line) +  // NOLINT
+    auto name = std::filesystem::path{file}.filename();
+    return "[" + name.string() + ":" + std::to_string(line) + "|" + logger.HumanDate() +
            "]: " + std::forward<std::string>(msg);
   }
-  return std::forward<std::string>(msg);
+  return std::string{"["} + logger.HumanDate() + "]" + std::forward<std::string>(msg);  // NOLINT
 }
-#endif
 }  // namespace detail
 
-void SafeColl(Result const& rc) {
-  if (!rc.OK()) {
-    LOG(FATAL) << rc.Report();
+void SafeColl(Result const& rc, char const* file, std::int32_t line) {
+  if (rc.OK()) {
+    return;
   }
+  if (file && line != -1) {
+    dmlc::DateLogger logger;
+    auto name = std::filesystem::path{file}.filename();
+    LOG(FATAL) << ("[" + name.string() + ":" + std::to_string(line) + "|" + logger.HumanDate() +
+                   "]:\n")
+               << rc.Report();
+    // Return just in case if this function is deep in ctypes callbacks.
+    return;
+  }
+  LOG(FATAL) << rc.Report();
 }
 }  // namespace xgboost::collective

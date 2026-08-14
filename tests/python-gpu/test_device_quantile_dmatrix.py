@@ -2,12 +2,16 @@ import sys
 
 import numpy as np
 import pytest
-from hypothesis import given, settings, strategies
-
 import xgboost as xgb
+from hypothesis import given, settings, strategies
 from xgboost import testing as tm
-from xgboost.testing.data import check_inf
+from xgboost.testing.data import check_inf, make_ltr
 from xgboost.testing.data_iter import run_mixed_sparsity
+from xgboost.testing.quantile_dmatrix import (
+    check_categorical_strings,
+    check_ref_quantile_cut,
+)
+from xgboost.testing.utils import predictor_equal
 
 sys.path.append("tests/python")
 import test_quantile_dmatrix as tqd
@@ -20,7 +24,7 @@ class TestQuantileDMatrix:
     def test_dmatrix_feature_weights(self) -> None:
         import cupy as cp
 
-        rng = cp.random.RandomState(1994)
+        rng = cp.random.RandomState(np.uint64(1994))
         data = rng.randn(5, 5)
         m = xgb.DMatrix(data)
 
@@ -32,6 +36,9 @@ class TestQuantileDMatrix:
             feature_weights.astype(np.float32),
         )
 
+    def test_categorical_strings(self) -> None:
+        check_categorical_strings("cuda")
+
     @pytest.mark.skipif(**tm.no_cupy())
     def test_dmatrix_cupy_init(self) -> None:
         import cupy as cp
@@ -40,10 +47,10 @@ class TestQuantileDMatrix:
         xgb.QuantileDMatrix(data, cp.ones(5, dtype=np.float64))
 
     @pytest.mark.parametrize(
-        "on_device,tree_method",
-        [(True, "hist"), (False, "gpu_hist"), (False, "hist"), (True, "gpu_hist")],
+        "on_device,device",
+        [(True, "cpu"), (False, "cuda"), (False, "cpu"), (True, "cuda")],
     )
-    def test_initialization(self, on_device: bool, tree_method: str) -> None:
+    def test_initialization(self, on_device: bool, device: str) -> None:
         n_samples, n_features, max_bin = 64, 3, 16
         X, y, w = tm.make_batches(
             n_samples,
@@ -52,24 +59,25 @@ class TestQuantileDMatrix:
             use_cupy=on_device,
         )
 
+        tree_method = "hist"
         # Init SparsePage
         Xy = xgb.DMatrix(X[0], y[0], weight=w[0])
         # Init GIDX/Ellpack
         xgb.train(
-            {"tree_method": tree_method, "max_bin": max_bin},
+            {"tree_method": tree_method, "max_bin": max_bin, "device": device},
             Xy,
             num_boost_round=1,
         )
         # query cuts from GIDX/Ellpack
         qXy = xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin, ref=Xy)
-        tm.predictor_equal(Xy, qXy)
+        predictor_equal(Xy, qXy)
         with pytest.raises(ValueError, match="Inconsistent"):
             # max_bin changed.
             xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin - 1, ref=Xy)
 
         # No error, DMatrix can be modified for different training session.
         xgb.train(
-            {"tree_method": tree_method, "max_bin": max_bin - 1},
+            {"tree_method": tree_method, "max_bin": max_bin - 1, "device": device},
             Xy,
             num_boost_round=1,
         )
@@ -78,25 +86,35 @@ class TestQuantileDMatrix:
         Xy = xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin)
         # Init GIDX/Ellpack
         xgb.train(
-            {"tree_method": tree_method, "max_bin": max_bin},
+            {"tree_method": tree_method, "max_bin": max_bin, "device": device},
             Xy,
             num_boost_round=1,
         )
         # query cuts from GIDX/Ellpack
         qXy = xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin, ref=Xy)
-        tm.predictor_equal(Xy, qXy)
+        predictor_equal(Xy, qXy)
         with pytest.raises(ValueError, match="Inconsistent"):
             # max_bin changed.
             xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin - 1, ref=Xy)
 
         Xy = xgb.DMatrix(X[0], y[0], weight=w[0])
         booster0 = xgb.train(
-            {"tree_method": "hist", "max_bin": max_bin, "max_depth": 4},
+            {
+                "tree_method": "hist",
+                "max_bin": max_bin,
+                "max_depth": 4,
+                "device": "cpu",
+            },
             Xy,
             num_boost_round=1,
         )
         booster1 = xgb.train(
-            {"tree_method": "gpu_hist", "max_bin": max_bin, "max_depth": 4},
+            {
+                "tree_method": "hist",
+                "max_bin": max_bin,
+                "max_depth": 4,
+                "device": "cuda",
+            },
             Xy,
             num_boost_round=1,
         )
@@ -107,10 +125,10 @@ class TestQuantileDMatrix:
 
     @pytest.mark.skipif(**tm.no_cupy())
     @pytest.mark.parametrize(
-        "tree_method,max_bin",
-        [("hist", 16), ("gpu_hist", 16), ("hist", 64), ("gpu_hist", 64)],
+        "device,max_bin",
+        [("cpu", 16), ("cuda", 16), ("cpu", 64), ("cuda", 64)],
     )
-    def test_interoperability(self, tree_method: str, max_bin: int) -> None:
+    def test_interoperability(self, device: str, max_bin: int) -> None:
         import cupy as cp
 
         n_samples = 64
@@ -121,7 +139,7 @@ class TestQuantileDMatrix:
         # from CPU
         Xy = xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin)
         booster_0 = xgb.train(
-            {"tree_method": tree_method, "max_bin": max_bin}, Xy, num_boost_round=4
+            {"device": device, "max_bin": max_bin}, Xy, num_boost_round=4
         )
 
         X[0] = cp.array(X[0])
@@ -131,7 +149,7 @@ class TestQuantileDMatrix:
         # from GPU
         Xy = xgb.QuantileDMatrix(X[0], y[0], weight=w[0], max_bin=max_bin)
         booster_1 = xgb.train(
-            {"tree_method": tree_method, "max_bin": max_bin}, Xy, num_boost_round=4
+            {"device": device, "max_bin": max_bin}, Xy, num_boost_round=4
         )
         cp.testing.assert_allclose(
             booster_0.inplace_predict(X[0]), booster_1.inplace_predict(X[0])
@@ -139,14 +157,19 @@ class TestQuantileDMatrix:
 
         with pytest.raises(ValueError, match=r"Only.*hist.*"):
             xgb.train(
-                {"tree_method": "approx", "max_bin": max_bin}, Xy, num_boost_round=4
+                {"tree_method": "approx", "max_bin": max_bin, "device": device},
+                Xy,
+                num_boost_round=4,
             )
+
+    def test_ref_quantile_cut(self) -> None:
+        check_ref_quantile_cut("cuda")
 
     @pytest.mark.skipif(**tm.no_cupy())
     def test_metainfo(self) -> None:
         import cupy as cp
 
-        rng = cp.random.RandomState(1994)
+        rng = cp.random.RandomState(np.uint64(1994))
 
         rows = 10
         cols = 3
@@ -170,8 +193,8 @@ class TestQuantileDMatrix:
     def test_ref_dmatrix(self) -> None:
         import cupy as cp
 
-        rng = cp.random.RandomState(1994)
-        self.cputest.run_ref_dmatrix(rng, "gpu_hist", False)
+        rng = cp.random.RandomState(np.uint64(1994))
+        self.cputest.run_ref_dmatrix(rng, "cuda", False)
 
     @given(
         strategies.integers(1, 1000),
@@ -179,7 +202,7 @@ class TestQuantileDMatrix:
         strategies.fractions(0, 0.99),
     )
     @settings(print_blob=True, deadline=None)
-    def test_to_csr(self, n_samples, n_features, sparsity) -> None:
+    def test_to_csr(self, n_samples: int, n_features: int, sparsity: float) -> None:
         import cupy as cp
 
         X, y = tm.make_sparse_regression(n_samples, n_features, sparsity, False)
@@ -214,17 +237,17 @@ class TestQuantileDMatrix:
     def test_ltr(self) -> None:
         import cupy as cp
 
-        X, y, qid, w = tm.make_ltr(100, 3, 3, 5)
+        X, y, qid, w = make_ltr(100, 3, 3, 5)
         # make sure GPU is used to run sketching.
         cpX = cp.array(X)
         Xy_qdm = xgb.QuantileDMatrix(cpX, y, qid=qid, weight=w)
         Xy = xgb.DMatrix(X, y, qid=qid, weight=w)
-        xgb.train({"tree_method": "gpu_hist", "objective": "rank:ndcg"}, Xy)
+        xgb.train({"device": "cuda", "objective": "rank:ndcg"}, Xy)
 
         from_dm = xgb.QuantileDMatrix(X, weight=w, ref=Xy)
         from_qdm = xgb.QuantileDMatrix(X, weight=w, ref=Xy_qdm)
 
-        assert tm.predictor_equal(from_qdm, from_dm)
+        assert predictor_equal(from_qdm, from_dm)
 
     @pytest.mark.skipif(**tm.no_cupy())
     def test_check_inf(self) -> None:

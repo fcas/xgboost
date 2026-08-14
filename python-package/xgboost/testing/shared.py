@@ -1,6 +1,5 @@
 """Testing code shared by other tests."""
 
-# pylint: disable=invalid-name
 import collections
 import importlib.util
 import json
@@ -38,20 +37,23 @@ def validate_data_initialization(
         return old_init(self, **kwargs)
 
     dmatrix.__init__ = new_init
-    model(n_estimators=1).fit(X, y, eval_set=[(X, y)])
+    try:
+        model(n_estimators=1).fit(X, y, eval_set=[(X, y)])
 
-    assert count[0] == 1
-    count[0] = 0  # only 1 DMatrix is created.
+        assert count[0] == 1
+        count[0] = 0  # only 1 DMatrix is created.
 
-    y_copy = y.copy()
-    model(n_estimators=1).fit(X, y, eval_set=[(X, y_copy)])
-    assert count[0] == 2  # a different Python object is considered different
-
-    dmatrix.__init__ = old_init
+        y_copy = y.copy()
+        model(n_estimators=1).fit(X, y, eval_set=[(X, y_copy)])
+        assert count[0] == 2  # a different Python object is considered different
+    finally:
+        # Always restore, even on exception.
+        dmatrix.__init__ = old_init
 
 
 # pylint: disable=too-many-arguments,too-many-locals
 def get_feature_weights(
+    *,
     X: ArrayLike,
     y: ArrayLike,
     fw: np.ndarray,
@@ -62,9 +64,13 @@ def get_feature_weights(
     """Get feature weights using the demo parser."""
     with tempfile.TemporaryDirectory() as tmpdir:
         colsample_bynode = 0.5
-        reg = model(tree_method=tree_method, colsample_bynode=colsample_bynode)
+        reg = model(
+            tree_method=tree_method,
+            colsample_bynode=colsample_bynode,
+            feature_weights=fw,
+        )
 
-        reg.fit(X, y, feature_weights=fw)
+        reg.fit(X, y)
         model_path = os.path.join(tmpdir, "model.json")
         reg.save_model(model_path)
         with open(model_path, "r", encoding="utf-8") as fd:

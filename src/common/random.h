@@ -1,5 +1,5 @@
 /**
- * Copyright 2015-2020, XGBoost Contributors
+ * Copyright 2015-2026, XGBoost Contributors
  * \file random.h
  * \brief Utility related to random.
  * \author Tianqi Chen
@@ -11,75 +11,16 @@
 
 #include <algorithm>
 #include <functional>
-#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
-#include <random>
-#include <utility>
 #include <vector>
 
-#include "../collective/communicator-inl.h"
-#include "algorithm.h"  // ArgSort
-#include "common.h"
+#include "algorithm.h"        // ArgSort
 #include "xgboost/context.h"  // Context
 #include "xgboost/host_device_vector.h"
 
 namespace xgboost::common {
-/*!
- * \brief Define mt19937 as default type Random Engine.
- */
-using RandomEngine = std::mt19937;
-
-#if defined(XGBOOST_CUSTOMIZE_GLOBAL_PRNG) && XGBOOST_CUSTOMIZE_GLOBAL_PRNG == 1
-/*!
- * \brief An customized random engine, used to be plugged in PRNG from other systems.
- *  The implementation of this library is not provided by xgboost core library.
- *  Instead the other library can implement this class, which will be used as GlobalRandomEngine
- *  If XGBOOST_RANDOM_CUSTOMIZE = 1, by default this is switched off.
- */
-class CustomGlobalRandomEngine {
- public:
-  /*! \brief The result type */
-  using result_type = uint32_t;
-  /*! \brief The minimum of random numbers generated */
-  inline static constexpr result_type min() {
-    return 0;
-  }
-  /*! \brief The maximum random numbers generated */
-  inline static constexpr result_type max() {
-    return std::numeric_limits<result_type>::max();
-  }
-  /*!
-   * \brief seed function, to be implemented
-   * \param val The value of the seed.
-   */
-  void seed(result_type val);
-  /*!
-   * \return next random number.
-   */
-  result_type operator()();
-};
-
-/*!
- * \brief global random engine
- */
-typedef CustomGlobalRandomEngine GlobalRandomEngine;
-
-#else
-/*!
- * \brief global random engine
- */
-using GlobalRandomEngine = RandomEngine;
-#endif  // XGBOOST_CUSTOMIZE_GLOBAL_PRNG
-
-/*!
- * \brief global singleton of a random engine.
- *  This random engine is thread-local and
- *  only visible to current thread.
- */
-GlobalRandomEngine& GlobalRandom(); // NOLINT(*)
-
 /*
  * Original paper:
  * Weighted Random Sampling (2005; Efraimidis, Spirakis)
@@ -88,13 +29,14 @@ GlobalRandomEngine& GlobalRandom(); // NOLINT(*)
  * https://timvieira.github.io/blog/post/2019/09/16/algorithms-for-sampling-without-replacement/
 */
 template <typename T>
-std::vector<T> WeightedSamplingWithoutReplacement(Context const* ctx, std::vector<T> const& array,
+std::vector<T> WeightedSamplingWithoutReplacement(Context const* ctx, RandomEngine* p_rng,
+                                                  std::vector<T> const& array,
                                                   std::vector<float> const& weights, size_t n) {
+  auto& rng = *p_rng;
   // ES sampling.
   CHECK_EQ(array.size(), weights.size());
   std::vector<float> keys(weights.size());
   std::uniform_real_distribution<float> dist;
-  auto& rng = GlobalRandom();
   for (size_t i = 0; i < array.size(); ++i) {
     auto w = std::max(weights.at(i), kRtEps);
     auto u = dist(rng);
@@ -118,16 +60,14 @@ void SampleFeature(Context const* ctx, bst_feature_t n_features,
                    std::shared_ptr<HostDeviceVector<bst_feature_t>> p_new_features,
                    HostDeviceVector<float> const& feature_weights,
                    HostDeviceVector<float>* weight_buffer,
-                   HostDeviceVector<bst_feature_t>* idx_buffer, GlobalRandomEngine* grng);
+                   HostDeviceVector<bst_feature_t>* idx_buffer);
 
 void InitFeatureSet(Context const* ctx,
                     std::shared_ptr<HostDeviceVector<bst_feature_t>> p_features);
 }  // namespace cuda_impl
 
 /**
- * \class ColumnSampler
- *
- * \brief Handles selection of columns due to colsample_bytree, colsample_bylevel and
+ * @brief Handles selection of columns due to colsample_bytree, colsample_bylevel and
  * colsample_bynode parameters. Should be initialised before tree construction and to
  * reset when tree construction is completed.
  */
@@ -138,21 +78,17 @@ class ColumnSampler {
   float colsample_bylevel_{1.0f};
   float colsample_bytree_{1.0f};
   float colsample_bynode_{1.0f};
-  GlobalRandomEngine rng_;
-  Context const* ctx_;
 
   // Used for weighted sampling.
   HostDeviceVector<bst_feature_t> idx_buffer_;
   HostDeviceVector<float> weight_buffer_;
 
- public:
   std::shared_ptr<HostDeviceVector<bst_feature_t>> ColSample(
-      std::shared_ptr<HostDeviceVector<bst_feature_t>> p_features, float colsample);
-  /**
-   * @brief Column sampler constructor.
-   * @note This constructor manually sets the rng seed
-   */
-  explicit ColumnSampler(std::uint32_t seed) { rng_.seed(seed); }
+      Context const* ctx, std::shared_ptr<HostDeviceVector<bst_feature_t>> p_features,
+      float colsample);
+
+ public:
+  ColumnSampler() = default;
 
   /**
    * @brief Initialise this object before use.
@@ -162,36 +98,41 @@ class ColumnSampler {
    * @param colsample_bylevel Sampling rate for tree level.
    * @param colsample_bytree  Sampling rate for tree.
    */
-  void Init(Context const* ctx, int64_t num_col, std::vector<float> feature_weights,
+  void Init(Context const* ctx, int64_t num_col, HostDeviceVector<float> const& feature_weights,
             float colsample_bynode, float colsample_bylevel, float colsample_bytree) {
-    feature_weights_.HostVector() = std::move(feature_weights);
+    this->feature_weights_.SetDevice(ctx->Device()), feature_weights.SetDevice(ctx->Device());
+    this->feature_weights_.Resize(feature_weights.Size());
+    this->feature_weights_.Copy(feature_weights);
+
     colsample_bylevel_ = colsample_bylevel;
     colsample_bytree_ = colsample_bytree;
     colsample_bynode_ = colsample_bynode;
-    ctx_ = ctx;
 
     if (feature_set_tree_ == nullptr) {
       feature_set_tree_ = std::make_shared<HostDeviceVector<bst_feature_t>>();
     }
     Reset();
 
-    feature_set_tree_->SetDevice(ctx->Device());
+    // We process ColumnSampler on host for SYCL. So don't need to push data to device
+    if (!ctx->Device().IsSycl()) {
+      feature_set_tree_->SetDevice(ctx->Device());
+    }
     feature_set_tree_->Resize(num_col);
-    if (ctx->IsCPU()) {
-      std::iota(feature_set_tree_->HostVector().begin(), feature_set_tree_->HostVector().end(), 0);
-    } else {
+    if (ctx->IsCUDA()) {
 #if defined(XGBOOST_USE_CUDA)
       cuda_impl::InitFeatureSet(ctx, feature_set_tree_);
 #else
       AssertGPUSupport();
 #endif
+    } else {
+      std::iota(feature_set_tree_->HostVector().begin(), feature_set_tree_->HostVector().end(), 0);
     }
 
-    feature_set_tree_ = ColSample(feature_set_tree_, colsample_bytree_);
+    feature_set_tree_ = ColSample(ctx, feature_set_tree_, colsample_bytree_);
   }
 
   /**
-   * \brief Resets this object.
+   * @brief Resets this object.
    */
   void Reset() {
     feature_set_tree_->Resize(0);
@@ -199,39 +140,42 @@ class ColumnSampler {
   }
 
   /**
-   * \brief Samples a feature set.
+   * @brief Samples a feature set.
    *
-   * \param depth The tree depth of the node at which to sample.
-   * \return The sampled feature set.
-   * \note If colsample_bynode_ < 1.0, this method creates a new feature set each time it
+   * @param ctx  The runtime context.
+   * @param depth The tree depth of the node at which to sample.
+   * @return The sampled feature set.
+   *
+   * @note If colsample_bynode_ < 1.0, this method creates a new feature set each time it
    * is called. Therefore, it should be called only once per node.
-   * \note With distributed xgboost, this function must be called exactly once for the
+   *
+   * @note With distributed xgboost, this function must be called exactly once for the
    * construction of each tree node, and must be called the same number of times in each
    * process and with the same parameters to return the same feature set across processes.
    */
-  std::shared_ptr<HostDeviceVector<bst_feature_t>> GetFeatureSet(int depth) {
+  std::shared_ptr<HostDeviceVector<bst_feature_t>> GetFeatureSet(Context const* ctx, int depth) {
     if (colsample_bylevel_ == 1.0f && colsample_bynode_ == 1.0f) {
       return feature_set_tree_;
     }
 
     if (feature_set_level_.count(depth) == 0) {
       // Level sampling, level does not yet exist so generate it
-      feature_set_level_[depth] = ColSample(feature_set_tree_, colsample_bylevel_);
+      feature_set_level_[depth] = ColSample(ctx, feature_set_tree_, colsample_bylevel_);
     }
     if (colsample_bynode_ == 1.0f) {
       // Level sampling
-      return feature_set_level_[depth];
+      auto ptr = feature_set_level_[depth];
+      ptr->SetDevice(ctx->Device());
+      return ptr;
     }
     // Need to sample for the node individually
-    return ColSample(feature_set_level_[depth], colsample_bynode_);
+    auto ptr = ColSample(ctx, feature_set_level_[depth], colsample_bynode_);
+    ptr->SetDevice(ctx->Device());
+    return ptr;
   }
 };
 
-inline auto MakeColumnSampler(Context const*) {
-  std::uint32_t seed = common::GlobalRandomEngine()();
-  collective::Broadcast(&seed, sizeof(seed), 0);
-  auto cs = std::make_shared<common::ColumnSampler>(seed);
-  return cs;
-}
+void SaveRng(Json* p_out, RandomEngine const& rng);
+void LoadRng(Json const& in, RandomEngine* rng);
 }  // namespace xgboost::common
 #endif  // XGBOOST_COMMON_RANDOM_H_

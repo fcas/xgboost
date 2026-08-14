@@ -4,7 +4,7 @@ XGBoost GPU Support
 
 This page contains information about GPU algorithms supported in XGBoost.
 
-.. note:: CUDA 11.0, Compute Capability 5.0 required (See `this list <https://en.wikipedia.org/wiki/CUDA#GPUs_supported>`_ to look up compute capability of your GPU card.)
+.. note:: CUDA >= 12.9 is required. See :ref:`wheel-cuda`.
 
 *********************************************
 CUDA Accelerated Tree Construction Algorithms
@@ -35,7 +35,10 @@ The GPU algorithms currently work with CLI, Python, R, and JVM packages. See :do
 
 GPU-Accelerated SHAP values
 =============================
-XGBoost makes use of `GPUTreeShap <https://github.com/rapidsai/gputreeshap>`_ as a backend for computing shap values when the GPU is used.
+XGBoost uses its in-tree ``QuadratureTreeSHAP`` implementation for computing SHAP values
+on both CPU and GPU. The GPU path uses the same Quadrature-TreeSHAP formulation described
+by Wettenstein et al. (2026) for exact TreeSHAP feature attributions when the GPU is
+selected.
 
 .. code-block:: python
 
@@ -43,13 +46,12 @@ XGBoost makes use of `GPUTreeShap <https://github.com/rapidsai/gputreeshap>`_ as
   shap_values = booster.predict(dtrain, pred_contribs=True)
   shap_interaction_values = model.predict(dtrain, pred_interactions=True)
 
-See :ref:`sphx_glr_python_gpu-examples_tree_shap.py` for a worked example.
+See :ref:`sphx_glr_python_examples_gpu_tree_shap.py` for a worked example.
 
 Multi-node Multi-GPU Training
 =============================
 
 XGBoost supports fully distributed GPU training using `Dask <https://dask.org/>`_, ``Spark`` and ``PySpark``. For getting started with Dask see our tutorial :doc:`/tutorials/dask` and worked examples :doc:`/python/dask-examples/index`, also Python documentation :ref:`dask_api` for complete reference. For usage with ``Spark`` using Scala see :doc:`/jvm/xgboost4j_spark_gpu_tutorial`. Lastly for distributed GPU training with ``PySpark``, see :doc:`/tutorials/spark_estimator`.
-
 
 Memory usage
 ============
@@ -61,7 +63,15 @@ The dataset itself is stored on device in a compressed ELLPACK format. The ELLPA
 
 Working memory is allocated inside the algorithm proportional to the number of rows to keep track of gradients, tree positions and other per row statistics. Memory is allocated for histogram bins proportional to the number of bins, number of features and nodes in the tree. For performance reasons we keep histograms in memory from previous nodes in the tree, when a certain threshold of memory usage is passed we stop doing this to conserve memory at some performance loss.
 
-If you are getting out-of-memory errors on a big dataset, try the or :py:class:`xgboost.QuantileDMatrix` or :doc:`external memory version </tutorials/external_memory>`. Note that when ``external memory`` is used for GPU hist, it's best to employ gradient based sampling as well. Last but not least, ``inplace_predict`` can be preferred over ``predict`` when data is already on GPU. Both ``QuantileDMatrix`` and ``inplace_predict`` are automatically enabled if you are using the scikit-learn interface.
+If you are getting out-of-memory errors on a big dataset, try the
+:py:class:`xgboost.QuantileDMatrix` first. If you have access to NVLink-C2C devices, see
+:doc:`external memory version </tutorials/external_memory>`. In addition,
+:py:meth:`~xgboost.Booster.inplace_predict` should be preferred over ``predict`` when data
+is already on GPU. Both :py:class:`xgboost.QuantileDMatrix` and
+:py:meth:`~xgboost.Booster.inplace_predict` are automatically enabled if you are using the
+scikit-learn interface. Last but not least, using :py:class:`~xgboost.QuantileDMatrix`
+with a data iterator as input is a great way to increase memory capacity, see
+:ref:`sphx_glr_python_examples_quantile_data_iterator.py`.
 
 
 CPU-GPU Interoperability
@@ -78,6 +88,10 @@ The application may be profiled with annotations by specifying ``USE_NTVX`` to c
 References
 **********
 `Mitchell R, Frank E. (2017) Accelerating the XGBoost algorithm using GPU computing. PeerJ Computer Science 3:e127 https://doi.org/10.7717/peerj-cs.127 <https://peerj.com/articles/cs-127/>`_
+
+`Lundberg SM, Erion GG, Lee S-I. (2018) Consistent Individualized Feature Attribution for Tree Ensembles. arXiv:1802.03888 <https://arxiv.org/abs/1802.03888>`_
+
+`Wettenstein R, Mitchell R, Yu P. (2026) Quadrature-TreeSHAP: Depth-Independent TreeSHAP and Shapley Interactions. arXiv:2605.04497 <https://arxiv.org/abs/2605.04497>`_
 
 `NVIDIA Parallel Forall: Gradient Boosting, Decision Trees and XGBoost with CUDA <https://devblogs.nvidia.com/parallelforall/gradient-boosting-decision-trees-xgboost-cuda/>`_
 
@@ -98,4 +112,4 @@ Many thanks to the following contributors (alphabetical order):
 * Sriram Chandramouli
 * Vinay Deshpande
 
-Please report bugs to the XGBoost issues list: https://github.com/dmlc/xgboost/issues.  For general questions please visit our user form: https://discuss.xgboost.ai/.
+Please report bugs to the XGBoost `issues list <https://github.com/dmlc/xgboost/issues>`__.

@@ -1,10 +1,11 @@
 /**
- * Copyright 2022-2023 by XGBoost contributors
+ * Copyright 2022-2024, XGBoost contributors
  */
 #include "test_iterative_dmatrix.h"
 
 #include <gtest/gtest.h>
-#include <limits>
+
+#include <limits>  // for numeric_limits
 #include <memory>
 
 #include "../../../src/data/gradient_index.h"

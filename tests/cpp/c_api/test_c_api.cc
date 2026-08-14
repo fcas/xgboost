@@ -1,5 +1,5 @@
 /**
- * Copyright 2019-2024 XGBoost contributors
+ * Copyright 2019-2026, XGBoost contributors
  */
 #include <gtest/gtest.h>
 #include <xgboost/c_api.h>
@@ -8,49 +8,24 @@
 #include <xgboost/learner.h>
 #include <xgboost/version_config.h>
 
-#include <array>      // for array
-#include <cstddef>    // std::size_t
-#include <filesystem> // std::filesystem
-#include <limits>     // std::numeric_limits
-#include <string>     // std::string
+#include <algorithm>   // for copy_n
+#include <array>       // for array
+#include <cstddef>     // std::size_t
+#include <filesystem>  // std::filesystem
+#include <limits>      // std::numeric_limits
+#include <string>      // std::string
 #include <vector>
 
 #include "../../../src/c_api/c_api_error.h"
 #include "../../../src/common/io.h"
+#include "../../../src/common/utils.h"              // for MakeCleanup
 #include "../../../src/data/adapter.h"              // for ArrayAdapter
 #include "../../../src/data/array_interface.h"      // for ArrayInterface
+#include "../../../src/data/batch_utils.h"          // for MatchingPageBytes
 #include "../../../src/data/gradient_index.h"       // for GHistIndexMatrix
 #include "../../../src/data/iterative_dmatrix.h"    // for IterativeDMatrix
 #include "../../../src/data/sparse_page_dmatrix.h"  // for SparsePageDMatrix
 #include "../helpers.h"
-
-TEST(CAPI, XGDMatrixCreateFromMatDT) {
-  std::vector<int> col0 = {0, -1, 3};
-  std::vector<float> col1 = {-4.0f, 2.0f, 0.0f};
-  const char *col0_type = "int32";
-  const char *col1_type = "float32";
-  std::vector<void *> data = {col0.data(), col1.data()};
-  std::vector<const char *> types = {col0_type, col1_type};
-  DMatrixHandle handle;
-  XGDMatrixCreateFromDT(data.data(), types.data(), 3, 2, &handle,
-                        0);
-  std::shared_ptr<xgboost::DMatrix> *dmat =
-      static_cast<std::shared_ptr<xgboost::DMatrix> *>(handle);
-  xgboost::MetaInfo &info = (*dmat)->Info();
-  ASSERT_EQ(info.num_col_, 2ul);
-  ASSERT_EQ(info.num_row_, 3ul);
-  ASSERT_EQ(info.num_nonzero_, 6ul);
-
-  for (const auto &batch : (*dmat)->GetBatches<xgboost::SparsePage>()) {
-    auto page = batch.GetView();
-    ASSERT_EQ(page[0][0].fvalue, 0.0f);
-    ASSERT_EQ(page[0][1].fvalue, -4.0f);
-    ASSERT_EQ(page[2][0].fvalue, 3.0f);
-    ASSERT_EQ(page[2][1].fvalue, 0.0f);
-  }
-
-  delete dmat;
-}
 
 TEST(CAPI, XGDMatrixCreateFromMatOmp) {
   std::vector<bst_ulong> num_rows = {100, 11374, 15000};
@@ -63,9 +38,8 @@ TEST(CAPI, XGDMatrixCreateFromMatOmp) {
       data[i] = std::numeric_limits<float>::quiet_NaN();
     }
 
-    XGDMatrixCreateFromMat_omp(data.data(), row, num_cols,
-                               std::numeric_limits<float>::quiet_NaN(), &handle,
-                               0);
+    XGDMatrixCreateFromMat_omp(data.data(), row, num_cols, std::numeric_limits<float>::quiet_NaN(),
+                               &handle, 0);
 
     std::shared_ptr<xgboost::DMatrix> *dmat =
         static_cast<std::shared_ptr<xgboost::DMatrix> *>(handle);
@@ -90,7 +64,7 @@ TEST(CAPI, XGDMatrixCreateFromMatOmp) {
 namespace xgboost {
 
 TEST(CAPI, Version) {
-  int patch {0};
+  int patch{0};
   XGBoostVersion(NULL, NULL, &patch);  // NOLINT
   ASSERT_EQ(patch, XGBOOST_VER_PATCH);
 }
@@ -108,33 +82,43 @@ TEST(CAPI, XGDMatrixCreateFromCSR) {
   Json::Dump(data_arr, &sdata);
   Json config{Object{}};
   config["missing"] = Number{std::numeric_limits<float>::quiet_NaN()};
-  config["data_split_mode"] = Integer{static_cast<int64_t>(DataSplitMode::kCol)};
+  config["data_split_mode"] = Integer{static_cast<int64_t>(1)};
   Json::Dump(config, &sconfig);
 
   DMatrixHandle handle;
-  XGDMatrixCreateFromCSR(sindptr.c_str(), sindices.c_str(), sdata.c_str(), 3, sconfig.c_str(),
-                         &handle);
-  bst_ulong n;
-  ASSERT_EQ(XGDMatrixNumRow(handle, &n), 0);
-  ASSERT_EQ(n, 1);
-  ASSERT_EQ(XGDMatrixNumCol(handle, &n), 0);
-  ASSERT_EQ(n, 3);
-  ASSERT_EQ(XGDMatrixNumNonMissing(handle, &n), 0);
-  ASSERT_EQ(n, 3);
-  ASSERT_EQ(XGDMatrixDataSplitMode(handle, &n), 0);
-  ASSERT_EQ(n, static_cast<int64_t>(DataSplitMode::kCol));
+  ASSERT_NE(XGDMatrixCreateFromCSR(sindptr.c_str(), sindices.c_str(), sdata.c_str(), 3,
+                                   sconfig.c_str(), &handle),
+            0);
+  auto msg = std::string{XGBGetLastError()};
+  ASSERT_NE(msg.find("Column-wise data split has been removed"), std::string::npos);
+}
 
-  std::shared_ptr<xgboost::DMatrix> *pp_fmat =
-      static_cast<std::shared_ptr<xgboost::DMatrix> *>(handle);
-  ASSERT_EQ((*pp_fmat)->Ctx()->Threads(), AllThreadsForTest());
+TEST(CAPI, SetParams) {
+  auto p_dmat = RandomDataGenerator{8, 4, 0.0f}.GenerateDMatrix();
+  std::array<DMatrixHandle, 1> mats{&p_dmat};
+  BoosterHandle booster;
+  ASSERT_EQ(XGBoosterCreate(mats.data(), mats.size(), &booster), 0);
 
-  XGDMatrixFree(handle);
+  char const *config =
+      R"({"params":[["objective","reg:absoluteerror"],["eval_metric","mae"],["eval_metric","rmse"]]})";
+  ASSERT_EQ(XGBoosterSetParams(booster, config), 0);
+
+  Json saved_config{Object{}};
+  static_cast<Learner *>(booster)->SaveConfig(&saved_config);
+  EXPECT_EQ(get<String const>(saved_config["learner"]["objective"]["name"]), "reg:absoluteerror");
+  EXPECT_EQ(get<Array const>(saved_config["learner"]["metrics"]).size(), 2);
+
+  ASSERT_EQ(XGBoosterSetParam(booster, "objective", "reg:squarederror"), 0);
+  Json single_config{Object{}};
+  static_cast<Learner *>(booster)->SaveConfig(&single_config);
+  EXPECT_EQ(get<String const>(single_config["learner"]["objective"]["name"]), "reg:squarederror");
+  EXPECT_EQ(XGBoosterFree(booster), 0);
 }
 
 TEST(CAPI, ConfigIO) {
   size_t constexpr kRows = 10;
   auto p_dmat = RandomDataGenerator(kRows, 10, 0).GenerateDMatrix();
-  std::vector<std::shared_ptr<DMatrix>> mat {p_dmat};
+  std::vector<std::shared_ptr<DMatrix>> mat{p_dmat};
   std::vector<bst_float> labels(kRows);
   for (size_t i = 0; i < labels.size(); ++i) {
     labels[i] = i;
@@ -142,21 +126,21 @@ TEST(CAPI, ConfigIO) {
   p_dmat->Info().labels.Data()->HostVector() = labels;
   p_dmat->Info().labels.Reshape(kRows);
 
-  std::shared_ptr<Learner> learner { Learner::Create(mat) };
+  std::shared_ptr<Learner> learner{Learner::Create(mat)};
 
   BoosterHandle handle = learner.get();
   learner->UpdateOneIter(0, p_dmat);
 
-  std::array<char const* , 1> out;
-  bst_ulong len {0};
+  std::array<char const *, 1> out;
+  bst_ulong len{0};
   XGBoosterSaveJsonConfig(handle, &len, out.data());
 
-  std::string config_str_0 { out[0] };
+  std::string config_str_0{out[0]};
   auto config_0 = Json::Load({config_str_0.c_str(), config_str_0.size()});
   XGBoosterLoadJsonConfig(handle, out[0]);
 
-  bst_ulong len_1 {0};
-  std::string config_str_1 { out[0] };
+  bst_ulong len_1{0};
+  std::string config_str_1{out[0]};
   XGBoosterSaveJsonConfig(handle, &len_1, out.data());
   auto config_1 = Json::Load({config_str_1.c_str(), config_str_1.size()});
 
@@ -169,7 +153,7 @@ TEST(CAPI, JsonModelIO) {
   auto tempdir = std::filesystem::temp_directory_path();
 
   auto p_dmat = RandomDataGenerator(kRows, kCols, 0).GenerateDMatrix();
-  std::vector<std::shared_ptr<DMatrix>> mat {p_dmat};
+  std::vector<std::shared_ptr<DMatrix>> mat{p_dmat};
   std::vector<bst_float> labels(kRows);
   for (size_t i = 0; i < labels.size(); ++i) {
     labels[i] = i;
@@ -177,7 +161,7 @@ TEST(CAPI, JsonModelIO) {
   p_dmat->Info().labels.Data()->HostVector() = labels;
   p_dmat->Info().labels.Reshape(kRows);
 
-  std::shared_ptr<Learner> learner { Learner::Create(mat) };
+  std::shared_ptr<Learner> learner{Learner::Create(mat)};
 
   learner->UpdateOneIter(0, p_dmat);
   BoosterHandle handle = learner.get();
@@ -186,7 +170,7 @@ TEST(CAPI, JsonModelIO) {
   XGBoosterSaveModel(handle, modelfile_0.u8string().c_str());
   XGBoosterLoadModel(handle, modelfile_0.u8string().c_str());
 
-  bst_ulong num_feature {0};
+  bst_ulong num_feature{0};
   ASSERT_EQ(XGBoosterGetNumFeature(handle, &num_feature), 0);
   ASSERT_EQ(num_feature, kCols);
 
@@ -228,12 +212,6 @@ TEST(CAPI, JsonModelIO) {
 }
 
 TEST(CAPI, CatchDMLCError) {
-  DMatrixHandle out;
-  ASSERT_EQ(XGDMatrixCreateFromFile("foo", 0, &out), -1);
-  EXPECT_THROW({ dmlc::Stream::Create("foo", "r"); },  dmlc::Error);
-}
-
-TEST(CAPI, CatchDMLCErrorURI) {
   Json config{Object()};
   config["uri"] = String{"foo"};
   config["silent"] = Integer{0};
@@ -241,7 +219,7 @@ TEST(CAPI, CatchDMLCErrorURI) {
   Json::Dump(config, &config_str);
   DMatrixHandle out;
   ASSERT_EQ(XGDMatrixCreateFromURI(config_str.c_str(), &out), -1);
-  EXPECT_THROW({ dmlc::Stream::Create("foo", "r"); },  dmlc::Error);
+  EXPECT_THROW({ dmlc::Stream::Create("foo", "r"); }, dmlc::Error);
 }
 
 TEST(CAPI, DMatrixSetFeatureName) {
@@ -251,24 +229,21 @@ TEST(CAPI, DMatrixSetFeatureName) {
   DMatrixHandle handle;
   std::vector<float> data(kCols * kRows, 1.5);
 
-  XGDMatrixCreateFromMat_omp(data.data(), kRows, kCols,
-                             std::numeric_limits<float>::quiet_NaN(), &handle,
-                             0);
+  XGDMatrixCreateFromMat_omp(data.data(), kRows, kCols, std::numeric_limits<float>::quiet_NaN(),
+                             &handle, 0);
   std::vector<std::string> feature_names;
   for (bst_feature_t i = 0; i < kCols; ++i) {
     feature_names.emplace_back(std::to_string(i));
   }
-  std::vector<char const*> c_feature_names;
+  std::vector<char const *> c_feature_names;
   c_feature_names.resize(feature_names.size());
-  std::transform(feature_names.cbegin(), feature_names.cend(),
-                 c_feature_names.begin(),
+  std::transform(feature_names.cbegin(), feature_names.cend(), c_feature_names.begin(),
                  [](auto const &str) { return str.c_str(); });
   XGDMatrixSetStrFeatureInfo(handle, u8"feature_name", c_feature_names.data(),
                              c_feature_names.size());
   bst_ulong out_len = 0;
   char const **c_out_features;
-  XGDMatrixGetStrFeatureInfo(handle, u8"feature_name", &out_len,
-                             &c_out_features);
+  XGDMatrixGetStrFeatureInfo(handle, u8"feature_name", &out_len, &c_out_features);
 
   CHECK_EQ(out_len, kCols);
   std::vector<std::string> out_features;
@@ -280,8 +255,7 @@ TEST(CAPI, DMatrixSetFeatureName) {
   static_assert(sizeof(feat_types) / sizeof(feat_types[0]) == kCols);
   XGDMatrixSetStrFeatureInfo(handle, "feature_type", feat_types.data(), kCols);
   char const **c_out_types;
-  XGDMatrixGetStrFeatureInfo(handle, u8"feature_type", &out_len,
-                             &c_out_types);
+  XGDMatrixGetStrFeatureInfo(handle, u8"feature_type", &out_len, &c_out_types);
   for (bst_ulong i = 0; i < out_len; ++i) {
     ASSERT_STREQ(feat_types[i], c_out_types[i]);
   }
@@ -296,7 +270,7 @@ int TestExceptionCatching() {
 }
 
 TEST(CAPI, Exception) {
-  ASSERT_NO_THROW({TestExceptionCatching();});
+  ASSERT_NO_THROW({ TestExceptionCatching(); });
   ASSERT_EQ(TestExceptionCatching(), -1);
   auto error = XGBGetLastError();
   // Not null
@@ -304,6 +278,10 @@ TEST(CAPI, Exception) {
 }
 
 TEST(CAPI, XGBGlobalConfig) {
+  auto guard = common::MakeCleanup([cfg_bak = *GlobalConfigThreadLocalStore::Get()] {
+    *GlobalConfigThreadLocalStore::Get() = cfg_bak;
+  });
+
   int ret;
   {
     const char *config_str = R"json(
@@ -319,8 +297,7 @@ TEST(CAPI, XGBGlobalConfig) {
     ASSERT_EQ(ret, 0);
 
     std::string updated_config_str{updated_config_cstr};
-    auto updated_config =
-        Json::Load({updated_config_str.data(), updated_config_str.size()});
+    auto updated_config = Json::Load({updated_config_str.data(), updated_config_str.size()});
     ASSERT_EQ(get<Integer>(updated_config["verbosity"]), 0);
     ASSERT_EQ(get<Boolean>(updated_config["use_rmm"]), false);
   }
@@ -337,8 +314,7 @@ TEST(CAPI, XGBGlobalConfig) {
     ASSERT_EQ(ret, 0);
 
     std::string updated_config_str{updated_config_cstr};
-    auto updated_config =
-        Json::Load({updated_config_str.data(), updated_config_str.size()});
+    auto updated_config = Json::Load({updated_config_str.data(), updated_config_str.size()});
     ASSERT_EQ(get<Boolean>(updated_config["use_rmm"]), true);
   }
   {
@@ -348,7 +324,7 @@ TEST(CAPI, XGBGlobalConfig) {
     }
   )json";
     ret = XGBSetGlobalConfig(config_str);
-    ASSERT_EQ(ret , -1);
+    ASSERT_EQ(ret, -1);
     auto err = std::string{XGBGetLastError()};
     ASSERT_NE(err.find("foo"), std::string::npos);
   }
@@ -360,7 +336,7 @@ TEST(CAPI, XGBGlobalConfig) {
     }
   )json";
     ret = XGBSetGlobalConfig(config_str);
-    ASSERT_EQ(ret , -1);
+    ASSERT_EQ(ret, -1);
     auto err = std::string{XGBGetLastError()};
     ASSERT_NE(err.find("foo"), std::string::npos);
     ASSERT_EQ(err.find("verbosity"), std::string::npos);
@@ -368,7 +344,7 @@ TEST(CAPI, XGBGlobalConfig) {
 }
 
 TEST(CAPI, BuildInfo) {
-  char const* out;
+  char const *out;
   XGBuildInfo(&out);
   auto loaded = Json::Load(StringView{out});
   ASSERT_TRUE(get<Object const>(loaded).find("USE_OPENMP") != get<Object const>(loaded).cend());
@@ -495,8 +471,13 @@ auto MakeExtMemForTest(bst_idx_t n_samples, bst_feature_t n_features, Json dconf
            0);
 
   NumpyArrayIterForTest iter_1{0.0f, n_samples, n_features, n_batches};
-  auto Xy = std::make_shared<data::SparsePageDMatrix>(
-      &iter_1, iter_1.Proxy(), Reset, Next, std::numeric_limits<float>::quiet_NaN(), 0, "");
+  auto config = ExtMemConfig{"",
+                             false,
+                             cuda_impl::AutoHostRatio(),
+                             cuda_impl::MatchingPageBytes(),
+                             std::numeric_limits<float>::quiet_NaN(),
+                             0};
+  auto Xy = std::make_shared<data::SparsePageDMatrix>(&iter_1, iter_1.Proxy(), Reset, Next, config);
   MakeLabelForTest(Xy, p_fmat);
   return std::pair{p_fmat, Xy};
 }
@@ -508,19 +489,25 @@ void CheckResult(Context const *ctx, bst_feature_t n_features, std::shared_ptr<D
     auto const &cut = page.Cuts();
     auto const &ptrs = cut.Ptrs();
     auto const &vals = cut.Values();
-    auto const &mins = cut.MinValues();
+    auto ft = Xy->Info().feature_types.ConstHostSpan();
+    std::uint64_t n_numeric{0};
     for (bst_feature_t f = 0; f < Xy->Info().num_col_; ++f) {
-      ASSERT_EQ(ptrs[f] + f, out_indptr[f]);
-      ASSERT_EQ(mins[f], out_data[out_indptr[f]]);
+      ASSERT_EQ(ptrs[f] + n_numeric, out_indptr[f]);
       auto beg = out_indptr[f];
       auto end = out_indptr[f + 1];
       auto val_beg = ptrs[f];
-      for (std::uint64_t i = beg + 1, j = val_beg; i < end; ++i, ++j) {
+      if (!common::IsCat(ft, f)) {
+        ASSERT_EQ(common::HistogramCuts::NumericBinLowerBound(ptrs, vals, f, ptrs[f]),
+                  out_data[beg]);
+        ++beg;
+        ++n_numeric;
+      }
+      for (std::uint64_t i = beg, j = val_beg; i < end; ++i, ++j) {
         ASSERT_EQ(vals[j], out_data[i]);
       }
     }
 
-    ASSERT_EQ(ptrs[n_features] + n_features, out_indptr[n_features]);
+    ASSERT_EQ(ptrs[n_features] + n_numeric, out_indptr[n_features]);
   }
 }
 
@@ -621,4 +608,125 @@ TEST(CAPI, GPUXGDMatrixGetQuantileCut) {
   TestXGDMatrixGetQuantileCut(&ctx);
 }
 #endif  // defined(XGBOOST_USE_CUDA)
+
+TEST(CAPI, PredictReuseProxy) {
+  // Configuration for creating DMatrix
+  Json fmat_cfg{Object{}};
+  fmat_cfg["missing"] = std::numeric_limits<float>::quiet_NaN();
+  auto sfmat_cfg = Json::Dump(fmat_cfg);
+
+  // Configuration for prediction
+  Json config{Object{}};
+  config["type"] = Integer{0};
+  config["iteration_begin"] = config["iteration_end"] = Integer{0};
+  config["missing"] = Number{std::numeric_limits<float>::quiet_NaN()};
+  config["strict_shape"] = Boolean{true};
+  config["training"] = Boolean{false};
+  auto scfg = Json::Dump(config);
+
+  HostDeviceVector<float> storage;
+  bst_idx_t n_samples = 1024;
+  auto inf = RandomDataGenerator{n_samples, 256, 0.0}.GenerateArrayInterface(&storage);
+  HostDeviceVector<float> storage_y;
+  auto y_inf = RandomDataGenerator{n_samples, 1, 0.0}.GenerateArrayInterface(&storage_y);
+
+  // Create a DMatrix for training
+  DMatrixHandle fmat_hdl{nullptr};
+  ASSERT_EQ(XGDMatrixCreateFromDense(inf.c_str(), sfmat_cfg.c_str(), &fmat_hdl), 0);
+  ASSERT_EQ(XGDMatrixSetInfoFromInterface(fmat_hdl, "label", y_inf.c_str()), 0);
+
+  // Create booster and train.
+  std::array<DMatrixHandle, 1> mats{fmat_hdl};
+  BoosterHandle booster_hdl;
+  ASSERT_EQ(XGBoosterCreate(mats.data(), 1, &booster_hdl), 0);
+
+  for (std::int32_t i = 0; i < 3; ++i) {
+    ASSERT_EQ(XGBoosterUpdateOneIter(booster_hdl, i, fmat_hdl), 0);
+  }
+
+  {
+    auto legacy_config = config;
+    legacy_config["ntree_limit"] = Integer{1};
+    auto s_legacy_config = Json::Dump(legacy_config);
+    bst_ulong const *outshape{nullptr};
+    bst_ulong outdim{0};
+    float const *result{nullptr};
+    ASSERT_EQ(XGBoosterPredictFromDMatrix(booster_hdl, fmat_hdl, s_legacy_config.c_str(), &outshape,
+                                          &outdim, &result),
+              -1);
+    ASSERT_NE(std::string{XGBGetLastError()}.find("ntree_limit"), std::string::npos);
+  }
+
+  // Create a proxy that can be reused.
+  DMatrixHandle proxy_hdl{nullptr};
+  ASSERT_EQ(XGProxyDMatrixCreate(&proxy_hdl), 0);
+
+  bst_ulong const *outshape{nullptr};
+  bst_ulong outdim{0};
+  float const *result{nullptr};
+
+  {
+    // Prediction with DMatrix
+    ASSERT_EQ(XGBoosterPredictFromDMatrix(booster_hdl, fmat_hdl, scfg.c_str(), &outshape, &outdim,
+                                          &result),
+              0);
+    bst_ulong n_samples_ret = 0;
+    ASSERT_EQ(XGDMatrixNumRow(fmat_hdl, &n_samples_ret), 0);
+    std::vector<float> vec_0(n_samples_ret);
+    ASSERT_EQ(vec_0.size(), n_samples);
+    ASSERT_EQ(outdim, 2);
+    std::copy_n(result, vec_0.size(), vec_0.begin());
+
+    // In-place predict
+    ASSERT_EQ(XGBoosterPredictFromDense(booster_hdl, inf.c_str(), scfg.c_str(), proxy_hdl,
+                                        &outshape, &outdim, &result),
+              0);
+    ASSERT_EQ(XGDMatrixNumRow(proxy_hdl, &n_samples_ret), 0);
+    std::vector<float> vec_1(n_samples_ret);
+    ASSERT_EQ(vec_1.size(), n_samples);
+    ASSERT_EQ(outdim, 2);
+    std::copy_n(result, vec_1.size(), vec_1.begin());
+
+    // Same result
+    ASSERT_EQ(vec_0, vec_1);
+  }
+
+  {
+    bst_idx_t n_samples = 512;
+
+    // Prediction with DMatrix
+    auto inf = RandomDataGenerator{n_samples, 256, 0.0}.GenerateArrayInterface(&storage);
+    DMatrixHandle fmat_hdl{nullptr};
+    ASSERT_EQ(XGDMatrixCreateFromDense(inf.c_str(), sfmat_cfg.c_str(), &fmat_hdl), 0);
+
+    ASSERT_EQ(XGBoosterPredictFromDMatrix(booster_hdl, fmat_hdl, scfg.c_str(), &outshape, &outdim,
+                                          &result),
+              0);
+    bst_ulong n_samples_ret = 0;
+    ASSERT_EQ(XGDMatrixNumRow(fmat_hdl, &n_samples_ret), 0);
+    std::vector<float> vec_0(n_samples_ret);
+    ASSERT_EQ(vec_0.size(), n_samples);
+    ASSERT_EQ(outdim, 2);
+    std::copy_n(result, vec_0.size(), vec_0.begin());
+
+    // In-place predict, same proxy as before
+    ASSERT_EQ(XGBoosterPredictFromDense(booster_hdl, inf.c_str(), scfg.c_str(), proxy_hdl,
+                                        &outshape, &outdim, &result),
+              0);
+    ASSERT_EQ(XGDMatrixNumRow(proxy_hdl, &n_samples_ret), 0);
+    std::vector<float> vec_1(n_samples_ret);
+    ASSERT_EQ(vec_1.size(), n_samples);
+    ASSERT_EQ(outdim, 2);
+    std::copy_n(result, vec_1.size(), vec_1.begin());
+
+    // Same result
+    ASSERT_EQ(vec_0, vec_1);
+
+    ASSERT_EQ(XGDMatrixFree(fmat_hdl), 0);
+  }
+
+  ASSERT_EQ(XGDMatrixFree(fmat_hdl), 0);
+  ASSERT_EQ(XGBoosterFree(booster_hdl), 0);
+  ASSERT_EQ(XGDMatrixFree(proxy_hdl), 0);
+}
 }  // namespace xgboost

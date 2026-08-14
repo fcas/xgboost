@@ -1,10 +1,9 @@
 /**
- * Copyright 2017-2024, XGBoost Contributors
+ * Copyright 2017-2025, XGBoost Contributors
  * \brief Data type for fast histogram aggregation.
  */
 #include "gradient_index.h"
 
-#include <algorithm>
 #include <limits>
 #include <memory>
 #include <utility>  // for forward
@@ -28,7 +27,7 @@ GHistIndexMatrix::GHistIndexMatrix(Context const *ctx, DMatrix *p_fmat, bst_bin_
   cut = common::SketchOnDMatrix(ctx, p_fmat, max_bins_per_feat, sorted_sketch, hess);
 
   const uint32_t nbins = cut.Ptrs().back();
-  hit_count = common::MakeFixedVecWithMalloc(nbins, std::size_t{0});
+  hit_count = common::MakeFixedVecWithMalloc(ctx, nbins, std::size_t{0});
   hit_count_tloc_.resize(ctx->Threads() * nbins, 0);
 
   size_t new_size = 1;
@@ -36,14 +35,14 @@ GHistIndexMatrix::GHistIndexMatrix(Context const *ctx, DMatrix *p_fmat, bst_bin_
     new_size += batch.Size();
   }
 
-  row_ptr = common::MakeFixedVecWithMalloc(new_size, std::size_t{0});
+  row_ptr = common::MakeFixedVecWithMalloc(ctx, new_size, std::size_t{0});
 
   const bool isDense = p_fmat->IsDense();
   this->isDense_ = isDense;
   auto ft = p_fmat->Info().feature_types.ConstHostSpan();
 
   for (const auto &batch : p_fmat->GetBatches<SparsePage>()) {
-    this->PushBatch(batch, ft, ctx->Threads());
+    this->PushBatch(ctx, batch, ft);
   }
   this->columns_ = std::make_unique<common::ColumnMatrix>();
 
@@ -63,7 +62,17 @@ GHistIndexMatrix::GHistIndexMatrix(MetaInfo const &info, common::HistogramCuts &
       hit_count{common::MakeFixedVecWithMalloc(cuts.TotalBins(), std::size_t{0})},
       cut{std::forward<common::HistogramCuts>(cuts)},
       max_numeric_bins_per_feat(max_bin_per_feat),
-      isDense_{info.num_col_ * info.num_row_ == info.num_nonzero_} {}
+      isDense_{info.IsDense()} {}
+
+GHistIndexMatrix::GHistIndexMatrix(bst_idx_t n_samples, bst_idx_t base_rowid,
+                                   common::HistogramCuts &&cuts, bst_bin_t max_bin_per_feat,
+                                   bool is_dense)
+    : row_ptr{common::MakeFixedVecWithMalloc(n_samples + 1, std::size_t{0})},
+      hit_count{common::MakeFixedVecWithMalloc(cuts.TotalBins(), std::size_t{0})},
+      cut{std::forward<common::HistogramCuts>(cuts)},
+      max_numeric_bins_per_feat(max_bin_per_feat),
+      base_rowid{base_rowid},
+      isDense_{is_dense} {}
 
 #if !defined(XGBOOST_USE_CUDA)
 GHistIndexMatrix::GHistIndexMatrix(Context const *, MetaInfo const &, EllpackPage const &,
@@ -74,35 +83,47 @@ GHistIndexMatrix::GHistIndexMatrix(Context const *, MetaInfo const &, EllpackPag
 
 GHistIndexMatrix::~GHistIndexMatrix() = default;
 
-void GHistIndexMatrix::PushBatch(SparsePage const &batch, common::Span<FeatureType const> ft,
-                                 int32_t n_threads) {
+void GHistIndexMatrix::PushBatch(Context const *ctx, SparsePage const &batch,
+                                 common::Span<FeatureType const> ft) {
   auto page = batch.GetView();
   auto it = common::MakeIndexTransformIter([&](std::size_t ridx) { return page[ridx].size(); });
-  common::PartialSum(n_threads, it, it + page.Size(), static_cast<size_t>(0), row_ptr.begin());
+  common::PartialSum(ctx->Threads(), it, it + page.Size(), static_cast<size_t>(0), row_ptr.begin());
   data::SparsePageAdapterBatch adapter_batch{page};
-  auto is_valid = [](auto) { return true; };  // SparsePage always contains valid entries
-  PushBatchImpl(n_threads, adapter_batch, 0, is_valid, ft);
+  auto is_valid = [](auto) {
+    return true;
+  };  // SparsePage always contains valid entries
+  PushBatchImpl(ctx, adapter_batch, 0, is_valid, ft);
 }
 
-GHistIndexMatrix::GHistIndexMatrix(SparsePage const &batch, common::Span<FeatureType const> ft,
-                                   common::HistogramCuts cuts, int32_t max_bins_per_feat,
-                                   bool isDense, double sparse_thresh, int32_t n_threads)
+GHistIndexMatrix::GHistIndexMatrix(Context const *ctx, SparsePage const &batch,
+                                   common::Span<FeatureType const> ft, common::HistogramCuts cuts,
+                                   bst_bin_t max_bins_per_feat, bool is_dense, double sparse_thresh)
     : cut{std::move(cuts)},
       max_numeric_bins_per_feat{max_bins_per_feat},
       base_rowid{batch.base_rowid},
-      isDense_{isDense} {
-  CHECK_GE(n_threads, 1);
+      isDense_{is_dense} {
   CHECK_EQ(row_ptr.size(), 0);
   row_ptr = common::MakeFixedVecWithMalloc(batch.Size() + 1, std::size_t{0});
 
   const uint32_t nbins = cut.Ptrs().back();
   hit_count = common::MakeFixedVecWithMalloc(nbins, std::size_t{0});
+  auto n_threads = ctx->Threads();
   hit_count_tloc_.resize(n_threads * nbins, 0);
 
-  this->PushBatch(batch, ft, n_threads);
+  this->PushBatch(ctx, batch, ft);
   this->columns_ = std::make_unique<common::ColumnMatrix>();
   if (!std::isnan(sparse_thresh)) {
     this->columns_->InitFromSparse(batch, *this, sparse_thresh, n_threads);
+  }
+  // Enforce global bin indices are sorted per row. This is required
+  // to construct histogram efficiently.
+  if (!isDense_) {
+    auto *index_data = index.data<uint32_t>();
+    common::ParallelFor(batch.Size(), n_threads, [&](size_t i) {
+      auto *begin = index_data + row_ptr[i];
+      auto *end = index_data + row_ptr[i + 1];
+      std::sort(begin, end);
+    });
   }
 }
 
@@ -111,6 +132,19 @@ void GHistIndexMatrix::PushAdapterBatchColumns(Context const *ctx, Batch const &
                                                float missing, size_t rbegin) {
   CHECK(columns_);
   this->columns_->PushBatch(ctx->Threads(), batch, missing, *this, rbegin);
+  // Enforce global bin indices are sorted per row. This is required
+  // to construct histogram efficiently.
+  if (!isDense_) {
+    auto n_threads = ctx->Threads();
+    auto batch_threads =
+        std::max(static_cast<size_t>(1), std::min(batch.Size(), static_cast<size_t>(n_threads)));
+    auto *index_data = index.data<uint32_t>();
+    common::ParallelFor(batch.Size(), batch_threads, [&](size_t i) {
+      auto *begin = index_data + row_ptr[rbegin + i];
+      auto *end = index_data + row_ptr[rbegin + i + 1];
+      std::sort(begin, end);
+    });
+  }
 }
 
 #define INSTANTIATION_PUSH(BatchT)                                 \
@@ -119,15 +153,23 @@ void GHistIndexMatrix::PushAdapterBatchColumns(Context const *ctx, Batch const &
 
 INSTANTIATION_PUSH(data::CSRArrayAdapterBatch)
 INSTANTIATION_PUSH(data::ArrayAdapterBatch)
+INSTANTIATION_PUSH(data::DenseAdapterBatch)
 INSTANTIATION_PUSH(data::SparsePageAdapterBatch)
 INSTANTIATION_PUSH(data::ColumnarAdapterBatch)
+INSTANTIATION_PUSH(data::EncColumnarAdapterBatch)
+
 #undef INSTANTIATION_PUSH
 
-void GHistIndexMatrix::ResizeIndex(const size_t n_index, const bool isDense) {
-  auto make_index = [this, n_index](auto t, common::BinTypeSize t_size) {
+void GHistIndexMatrix::ResizeColumns(double sparse_thresh) {
+  CHECK(!std::isnan(sparse_thresh));
+  this->columns_ = std::make_unique<common::ColumnMatrix>(*this, sparse_thresh);
+}
+
+void GHistIndexMatrix::ResizeIndex(Context const *ctx, const size_t n_index, const bool isDense) {
+  auto make_index = [this, ctx, n_index](auto t, common::BinTypeSize t_size) {
     // Must resize instead of allocating a new one. This function is called everytime a
-    // new batch is pushed, and we grow the size accordingly without loosing the data the
-    // previous batches.
+    // new batch is pushed, and we grow the size accordingly without loosing the data in
+    // the previous batches.
     using T = decltype(t);
     std::size_t n_bytes = sizeof(T) * n_index;
     CHECK_GE(n_bytes, this->data.size());
@@ -136,7 +178,7 @@ void GHistIndexMatrix::ResizeIndex(const size_t n_index, const bool isDense) {
     decltype(this->data) new_vec;
     if (!resource) {
       CHECK(this->data.empty());
-      new_vec = common::MakeFixedVecWithMalloc(n_bytes, std::uint8_t{0});
+      new_vec = common::MakeFixedVecWithMalloc(ctx, n_bytes, std::uint8_t{0});
     } else {
       CHECK(resource->Type() == common::ResourceHandler::kMalloc);
       auto malloc_resource = std::dynamic_pointer_cast<common::MallocResource>(resource);
@@ -148,8 +190,8 @@ void GHistIndexMatrix::ResizeIndex(const size_t n_index, const bool isDense) {
       new_vec = {new_ptr, n_bytes / sizeof(std::uint8_t), malloc_resource};
     }
     this->data = std::move(new_vec);
-    this->index = common::Index{common::Span{data.data(), static_cast<size_t>(data.size())},
-        t_size};
+    this->index =
+        common::Index{common::Span{data.data(), static_cast<size_t>(data.size())}, t_size};
   };
 
   if ((MaxNumBinPerFeat() - 1 <= static_cast<int>(std::numeric_limits<uint8_t>::max())) &&
@@ -175,39 +217,30 @@ common::ColumnMatrix const &GHistIndexMatrix::Transpose() const {
 bst_bin_t GHistIndexMatrix::GetGindex(size_t ridx, size_t fidx) const {
   auto begin = RowIdx(ridx);
   if (IsDense()) {
-    return static_cast<bst_bin_t>(index[begin + fidx]);
+    return static_cast<bst_bin_t>(this->index[begin + fidx]);
   }
   auto end = RowIdx(ridx + 1);
-  auto const& cut_ptrs = cut.Ptrs();
+  auto const &cut_ptrs = cut.Ptrs();
   auto f_begin = cut_ptrs[fidx];
   auto f_end = cut_ptrs[fidx + 1];
-  return BinarySearchBin(begin, end, index, f_begin, f_end);
+  return BinarySearchBin(begin, end, this->index, f_begin, f_end);
 }
 
 float GHistIndexMatrix::GetFvalue(size_t ridx, size_t fidx, bool is_cat) const {
   auto const &values = cut.Values();
-  auto const &mins = cut.MinValues();
   auto const &ptrs = cut.Ptrs();
-  return this->GetFvalue(ptrs, values, mins, ridx, fidx, is_cat);
+  return this->GetFvalue(ptrs, values, ridx, fidx, is_cat);
 }
 
-float GHistIndexMatrix::GetFvalue(std::vector<std::uint32_t> const &ptrs,
-                                  std::vector<float> const &values, std::vector<float> const &mins,
-                                  bst_idx_t ridx, bst_feature_t fidx, bool is_cat) const {
-  if (is_cat) {
-    auto gidx = GetGindex(ridx, fidx);
-    if (gidx == -1) {
-      return std::numeric_limits<float>::quiet_NaN();
-    }
-    return values[gidx];
-  }
-
+float GetFvalueImpl(std::vector<std::uint32_t> const &ptrs, std::vector<float> const &values,
+                    bst_idx_t ridx, bst_feature_t fidx, bst_idx_t base_rowid,
+                    std::unique_ptr<common::ColumnMatrix> const &columns_) {
   auto get_bin_val = [&](auto &column) {
-    auto bin_idx = column[ridx];
+    auto bin_idx = column[ridx - base_rowid];
     if (bin_idx == common::DenseColumnIter<uint8_t, true>::kMissingId) {
       return std::numeric_limits<float>::quiet_NaN();
     }
-    return common::HistogramCuts::NumericBinValue(ptrs, values, mins, fidx, bin_idx);
+    return common::HistogramCuts::NumericBinValue(ptrs, values, fidx, bin_idx);
   };
   switch (columns_->GetColumnType(fidx)) {
     case common::kDenseColumn: {
@@ -219,8 +252,8 @@ float GHistIndexMatrix::GetFvalue(std::vector<std::uint32_t> const &ptrs,
       } else {
         return common::DispatchBinType(columns_->GetTypeSize(), [&](auto dtype) {
           auto column = columns_->DenseColumn<decltype(dtype), false>(fidx);
-          auto bin_idx = column[ridx];
-          return common::HistogramCuts::NumericBinValue(ptrs, values, mins, fidx, bin_idx);
+          auto bin_idx = column[ridx - base_rowid];
+          return common::HistogramCuts::NumericBinValue(ptrs, values, fidx, bin_idx);
         });
       }
     }

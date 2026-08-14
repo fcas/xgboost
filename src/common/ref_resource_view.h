@@ -1,5 +1,5 @@
 /**
- * Copyright 2023-2024, XGBoost Contributors
+ * Copyright 2023-2025, XGBoost Contributors
  */
 #ifndef XGBOOST_COMMON_REF_RESOURCE_VIEW_H_
 #define XGBOOST_COMMON_REF_RESOURCE_VIEW_H_
@@ -11,7 +11,9 @@
 #include <type_traits>  // for is_reference_v, remove_reference_t, is_same_v
 #include <utility>      // for swap, move
 
-#include "io.h"  // for ResourceHandler, AlignedResourceReadStream, MallocResource
+#include "io.h"               // for ResourceHandler, AlignedResourceReadStream, MallocResource
+#include "threading_utils.h"  // for ParallelForBlock
+#include "xgboost/context.h"  // for Context
 #include "xgboost/logging.h"
 #include "xgboost/span.h"  // for Span
 
@@ -43,24 +45,16 @@ class RefResourceView {
   }
 
  public:
-  RefResourceView(value_type* ptr, size_type n, std::shared_ptr<common::ResourceHandler> mem)
-      : ptr_{ptr}, size_{n}, mem_{std::move(mem)} {
-    CHECK_GE(mem_->Size(), n);
-  }
   /**
    * @brief Construct a view on ptr with length n. The ptr is held by the mem resource.
    *
    * @param ptr  The pointer to view.
    * @param n    The length of the view.
    * @param mem  The owner of the pointer.
-   * @param init Initialize the view with this value.
    */
-  RefResourceView(value_type* ptr, size_type n, std::shared_ptr<common::ResourceHandler> mem,
-                  T const& init)
-      : RefResourceView{ptr, n, mem} {
-    if (n != 0) {
-      std::fill_n(ptr_, n, init);
-    }
+  RefResourceView(value_type* ptr, size_type n, std::shared_ptr<common::ResourceHandler> mem)
+      : ptr_{ptr}, size_{n}, mem_{std::move(mem)} {
+    CHECK_GE(mem_->Size(), n);
   }
 
   ~RefResourceView() = default;
@@ -76,7 +70,7 @@ class RefResourceView {
 
   [[nodiscard]] size_type size() const { return size_; }  // NOLINT
   [[nodiscard]] size_type size_bytes() const {            // NOLINT
-    return Span<const value_type>{data(), static_cast<size_t>(size())}.size_bytes();
+    return Span<const value_type>{data(), static_cast<std::size_t>(size())}.size_bytes();
   }
   [[nodiscard]] value_type* data() { return ptr_; };              // NOLINT
   [[nodiscard]] value_type const* data() const { return ptr_; };  // NOLINT
@@ -96,6 +90,16 @@ class RefResourceView {
 
   [[nodiscard]] value_type& operator[](size_type i) { return ptr_[i]; }
   [[nodiscard]] value_type const& operator[](size_type i) const { return ptr_[i]; }
+  [[nodiscard]] value_type& at(size_type i) {  // NOLINT
+    SPAN_LT(i, this->size_);
+    return ptr_[i];
+  }
+  [[nodiscard]] value_type const& at(size_type i) const {  // NOLINT
+    SPAN_LT(i, this->size_);
+    return ptr_[i];
+  }
+  [[nodiscard]] Span<std::add_const_t<T>> ToSpan() const { return {this->data(), this->size()}; }
+  [[nodiscard]] Span<T> ToSpan() { return {this->data(), this->size()}; }
 
   /**
    * @brief Get the underlying resource.
@@ -159,7 +163,25 @@ template <typename Vec>
 template <typename T>
 [[nodiscard]] RefResourceView<T> MakeFixedVecWithMalloc(std::size_t n_elements, T const& init) {
   auto resource = std::make_shared<common::MallocResource>(n_elements * sizeof(T));
-  return RefResourceView{resource->DataAs<T>(), n_elements, resource, init};
+  auto ref = RefResourceView{resource->DataAs<T>(), n_elements, resource};
+  std::fill_n(ref.data(), ref.size(), init);
+  return ref;
+}
+
+/**
+ * @brief Make a fixed size `RefResourceView` with malloc resource.
+ *
+ * Use n_threads to initialize the storage
+ */
+template <typename T>
+[[nodiscard]] RefResourceView<T> MakeFixedVecWithMalloc(Context const* ctx, std::size_t n_elements,
+                                                        T const& init) {
+  auto resource = std::make_shared<common::MallocResource>(n_elements * sizeof(T));
+  auto ref = RefResourceView{resource->DataAs<T>(), n_elements, resource};
+  common::ParallelForBlock(n_elements, ctx->Threads(), [&](auto&& block) {
+    std::fill_n(ref.data() + block.begin(), block.Size(), init);
+  });
+  return ref;
 }
 
 template <typename T>

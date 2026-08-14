@@ -11,8 +11,9 @@ Documentation and Examples
 *************
 Documentation
 *************
-* Python and C documentation is built using `Sphinx <http://www.sphinx-doc.org/en/master/>`_.
-* Each document is written in `reStructuredText <http://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html>`_.
+
+* Python and C documentation is built using `Sphinx <https://www.sphinx-doc.org/en/master/>`_.
+* Each document is written in `reStructuredText <https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html>`_.
 * The documentation is the ``doc/`` directory.
 * You can build it locally using ``make html`` command.
 
@@ -32,9 +33,9 @@ Build the Python Docs using pip and Conda
 
    .. code-block:: bash
 
-     conda create -n xgboost-docs --yes python=3.10
+     conda create -n xgboost-docs --yes python=3.12
 
-   .. note:: Python 3.10 is required by `xgboost_ray <https://github.com/ray-project/xgboost_ray>`__ package.
+   .. note:: Python is required to match XGBoost's minimum supported Python version.
 
 #. Activate the environment
 
@@ -81,6 +82,44 @@ Build the Python Docs using pip and Conda
 
     Build finished. The HTML pages are in _build/html.
 
+*************
+Read The Docs
+*************
+
+`Read the Docs <https://readthedocs.org/>`__ (RTD for short) is an online document hosting
+service and hosts the `XGBoost document site
+<https://xgboost.readthedocs.io/en/stable/>`__. The document builder used by RTD is
+relatively lightweight. However some of the packages like the R binding require a compiled
+XGBoost along with all the optional dependencies to render the document. As a result, both
+jvm-based packages and the R package's document is built with an independent CI pipeline
+and fetched during online document build.
+
+The sphinx configuration file ``xgboost/doc/conf.py`` acts as the fetcher. During build,
+the fetched artifacts are stored in ``xgboost/doc/tmp/jvm_docs`` and
+``xgboost/doc/tmp/r_docs`` respectively. For the R package, there's a dummy index file in
+``xgboost/doc/R-package/r_docs`` . Jvm doc is similar. As for the C doc, it's generated
+using doxygen and processed by breathe during build as it's relatively cheap. The
+generated xml files are stored in ``xgboost/doc/tmp/dev`` .
+
+The ``xgboost/doc/tmp`` is part of the ``html_extra_path`` sphinx configuration specified
+in the ``conf.py`` file, which informs sphinx to copy the extracted html files to the
+build directory. Following is a list of environment variables used by the fetchers in
+``conf.py``:
+
+ - ``READTHEDOCS``: Read the docs flag. Build the full documentation site including R, JVM and
+   C doc when set to ``True`` (case sensitive).
+ - ``XGBOOST_R_DOCS``: Local path for pre-built R document, used for development. If it
+   points to a file that doesn't exist, the configuration script will download the
+   packaged document to that path for future reuse.
+ - ``XGBOOST_JVM_DOCS``: Local path for pre-built JVM document, used for
+   development. Similar to the R docs environment variable when it points to a non-existent
+   file.
+
+As of writing, RTD doesn't provide any facility to be embedded as a GitHub action but we
+need a way to specify the dependency between the CI pipelines and the document build in
+order to fetch the correct artifact. The workaround is to use an extra GA step to notify
+RTD using its `REST API <https://docs.readthedocs.com/platform/stable/api/v3.html>`__.
+
 ********
 Examples
 ********
@@ -88,3 +127,22 @@ Examples
 * We are super excited to hear about your story. If you have blog posts,
   tutorials, or code solutions using XGBoost, please tell us, and we will add
   a link in the example pages.
+
+*********
+Doc Tests
+*********
+
+We use Sphinx doctest to test selected snippets in the documentation. At the moment, this
+only covers Python and R snippets written with ``.. code-tab:: python`` or ``.. code-tab::
+r``. Regular code blocks are rendered as examples but are not executed by the doctest job.
+
+The doctest job runs snippets from each ``.rst`` file as an independent group. Snippets in
+the same document share state, while snippets from different documents do not. To skip a
+tabbed snippet, add the ``no-doctest`` class:
+
+.. code-block:: rst
+
+  .. code-tab:: python
+     :class: no-doctest
+
+     # This snippet is rendered but not tested.

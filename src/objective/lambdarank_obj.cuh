@@ -1,43 +1,42 @@
 /**
- * Copyright 2023 XGBoost contributors
+ * Copyright 2023-2026, XGBoost contributors
  */
-#ifndef XGBOOST_OBJECTIVE_LAMBDARANK_OBJ_CUH_
-#define XGBOOST_OBJECTIVE_LAMBDARANK_OBJ_CUH_
+#pragma once
 
-#include <thrust/binary_search.h>                      // for lower_bound, upper_bound
-#include <thrust/functional.h>                         // for greater
-#include <thrust/iterator/counting_iterator.h>         // for make_counting_iterator
-#include <thrust/random/linear_congruential_engine.h>  // for minstd_rand
-#include <thrust/random/uniform_int_distribution.h>    // for uniform_int_distribution
+#include <thrust/binary_search.h>                    // for lower_bound, upper_bound
+#include <thrust/functional.h>                       // for greater
+#include <thrust/iterator/counting_iterator.h>       // for make_counting_iterator
+#include <thrust/random/uniform_int_distribution.h>  // for uniform_int_distribution
 
-#include <cassert>                                     // for cassert
-#include <cstddef>                                     // for size_t
-#include <cstdint>                                     // for int32_t
-#include <tuple>                                       // for make_tuple, tuple
+#include <cassert>  // for cassert
+#include <cstddef>  // for size_t
+#include <cstdint>  // for uint32_t
+#include <tuple>    // for make_tuple, tuple
 
-#include "../common/device_helpers.cuh"                // for MakeTransformIterator
-#include "../common/ranking_utils.cuh"                 // for PairsForGroup
-#include "../common/ranking_utils.h"                   // for RankingCache
-#include "../common/threading_utils.cuh"               // for UnravelTrapeziodIdx
-#include "xgboost/base.h"    // for bst_group_t, GradientPair, XGBOOST_DEVICE
-#include "xgboost/data.h"    // for MetaInfo
-#include "xgboost/linalg.h"  // for VectorView, Range, UnravelIndex
-#include "xgboost/span.h"    // for Span
+#include "../common/device_helpers.cuh"   // for MakeTransformIterator
+#include "../common/random.cuh"           // for DefaultRng
+#include "../common/ranking_utils.cuh"    // for PairsForGroup
+#include "../common/ranking_utils.h"      // for RankingCache
+#include "../common/threading_utils.cuh"  // for UnravelTrapeziodIdx
+#include "xgboost/base.h"                 // for bst_group_t, GradientPair, XGBOOST_DEVICE
+#include "xgboost/data.h"                 // for MetaInfo
+#include "xgboost/linalg.h"               // for VectorView, Range, UnravelIndex
+#include "xgboost/span.h"                 // for Span
 
 namespace xgboost::obj::cuda_impl {
 /**
- * \brief Find number of elements left to the label bucket
+ * @brief Find number of elements left to the label bucket
  */
 template <typename It, typename T = typename std::iterator_traits<It>::value_type>
 XGBOOST_DEVICE __forceinline__ std::size_t CountNumItemsToTheLeftOf(It items, std::size_t n, T v) {
-  return thrust::lower_bound(thrust::seq, items, items + n, v, thrust::greater<T>{}) - items;
+  return thrust::lower_bound(thrust::seq, items, items + n, v, cuda::std::greater{}) - items;
 }
 /**
- * \brief Find number of elements right to the label bucket
+ * @brief Find number of elements right to the label bucket
  */
 template <typename It, typename T = typename std::iterator_traits<It>::value_type>
 XGBOOST_DEVICE __forceinline__ std::size_t CountNumItemsToTheRightOf(It items, std::size_t n, T v) {
-  return n - (thrust::upper_bound(thrust::seq, items, items + n, v, thrust::greater<T>{}) - items);
+  return n - (thrust::upper_bound(thrust::seq, items, items + n, v, cuda::std::greater{}) - items);
 }
 /**
  * \brief Sort labels according to rank list for making pairs.
@@ -68,16 +67,16 @@ struct KernelInputs {
 
   common::Span<std::size_t const> d_y_sorted_idx;
 
-  std::int32_t iter;
+  std::uint32_t seed;
 };
 /**
- * \brief Functor for generating pairs
+ * @brief Functor for generating pairs
  */
 template <bool has_truncation>
 struct MakePairsOp {
   KernelInputs args;
   /**
-   * \brief Make pair for the topk pair method.
+   * @brief Make pair for the topk pair method.
    */
   [[nodiscard]] XGBOOST_DEVICE std::tuple<std::size_t, std::size_t> WithTruncation(
       std::size_t idx, bst_group_t g) const {
@@ -86,9 +85,6 @@ struct MakePairsOp {
 
     auto data_group_begin = static_cast<std::size_t>(args.d_group_ptr[g]);
     std::size_t n_data = args.d_group_ptr[g + 1] - data_group_begin;
-    // obtain group segment data.
-    auto g_label = args.labels.Slice(linalg::Range(data_group_begin, data_group_begin + n_data), 0);
-    auto g_sorted_idx = args.d_sorted_idx.subspan(data_group_begin, n_data);
 
     std::size_t i = 0, j = 0;
     common::UnravelTrapeziodIdx(idx_in_thread_group, n_data, &i, &j);
@@ -97,7 +93,7 @@ struct MakePairsOp {
     return std::make_tuple(rank_high, rank_low);
   }
   /**
-   * \brief Make pair for the mean pair method
+   * @brief Make pair for the mean pair method
    */
   XGBOOST_DEVICE std::tuple<std::size_t, std::size_t> WithSampling(std::size_t idx,
                                                                    bst_group_t g) const {
@@ -139,10 +135,10 @@ struct MakePairsOp {
     // The index pointing to the first element of the next bucket
     std::size_t right_bound = n_data - n_rights;
 
-    thrust::minstd_rand rng(args.iter);
+    common::cuda_impl::DefaultRng rng{args.seed + static_cast<std::uint32_t>(g)};
     auto pair_idx = i;
-    rng.discard(sample_pair_idx * n_data + g + pair_idx);  // fixme
-    thrust::uniform_int_distribution<std::size_t> dist(0, n_lefts + n_rights - 1);
+    rng.discard(idx - args.d_threads_group_ptr[g]);  // idx within group
+    common::cuda_impl::UniformIntDistribution<std::size_t> dist(0, n_lefts + n_rights - 1);
     auto ridx = dist(rng);
     SPAN_CHECK(ridx < n_lefts + n_rights);
     if (ridx >= n_lefts) {
@@ -169,4 +165,3 @@ struct MakePairsOp {
   }
 };
 }  // namespace xgboost::obj::cuda_impl
-#endif  // XGBOOST_OBJECTIVE_LAMBDARANK_OBJ_CUH_

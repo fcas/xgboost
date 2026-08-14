@@ -1,33 +1,31 @@
 /**
- * Copyright 2019-2024, XGBoost Contributors
+ * Copyright 2019-2026, XGBoost Contributors
  * \file array_interface.h
  * \brief View of __array_interface__
  */
 #ifndef XGBOOST_DATA_ARRAY_INTERFACE_H_
 #define XGBOOST_DATA_ARRAY_INTERFACE_H_
 
-#include <algorithm>
-#include <cstddef>  // for size_t
-#include <cstdint>
-#include <limits>  // for numeric_limits
-#include <map>
-#include <string>
-#include <type_traits>  // for alignment_of, remove_pointer_t, invoke_result_t
-#include <utility>
-#include <vector>
+#include <algorithm>    // for all_of, transform, fill
+#include <cstddef>      // for size_t
+#include <cstdint>      // for int32_t, int64_t, ...
+#include <limits>       // for numeric_limits
+#include <map>          // for map
+#include <string>       // for string
+#include <string_view>  // for string_view
+#include <type_traits>  // for alignment_of_v, remove_pointer_t, invoke_result_t
+#include <vector>       // for vector
 
-#include "../common/bitfield.h"  // for RBitField8
-#include "../common/common.h"
+#include "../common/bitfield.h"   // for RBitField8
 #include "../common/error_msg.h"  // for NoF128
-#include "xgboost/base.h"
-#include "xgboost/data.h"
-#include "xgboost/json.h"
-#include "xgboost/linalg.h"
-#include "xgboost/logging.h"
-#include "xgboost/span.h"
+#include "xgboost/json.h"         // for Json
+#include "xgboost/linalg.h"       // for CalcStride, TensorView
+#include "xgboost/logging.h"      // for CHECK
+#include "xgboost/span.h"         // for Span
+#include "xgboost/string_view.h"  // for StringView
 
 #if defined(XGBOOST_USE_CUDA)
-#include "cuda_fp16.h"
+#include "cuda_fp16.h"  // for __half
 #endif
 
 namespace xgboost {
@@ -58,7 +56,7 @@ struct ArrayInterfaceErrors {
     return str.c_str();
   }
 
-  static std::string TypeStr(char c) {
+  static std::string_view TypeStr(char c) {
     switch (c) {
       case 't':
         return "Bit field";
@@ -94,8 +92,8 @@ struct ArrayInterfaceErrors {
     }
   }
 
-  static std::string UnSupportedType(StringView typestr) {
-    return TypeStr(typestr[1]) + "-" + typestr[2] + " is not supported.";
+  static std::string UnSupportedType(std::string_view typestr) {
+    return std::string{TypeStr(typestr[1])} + "-" + typestr[2] + " is not supported.";  // NOLINT
   }
 };
 
@@ -118,6 +116,8 @@ class ArrayInterfaceHandler {
     kU4 = 10,
     kU8 = 11,
   };
+
+  static std::string TypeStr(Type type);
 
   template <typename PtrType>
   static PtrType GetPtrFromArrayData(Object::Map const &obj) {
@@ -254,8 +254,8 @@ class ArrayInterfaceHandler {
    * \brief Extracts the optiona `strides' field and returns whether the array is c-contiguous.
    */
   template <int32_t D>
-  static bool ExtractStride(Object::Map const &array, size_t itemsize,
-                            size_t (&shape)[D], size_t (&stride)[D]) {
+  static bool ExtractStride(Object::Map const &array, size_t itemsize, size_t (&shape)[D],
+                            size_t (&stride)[D]) {
     auto strides_it = array.find("strides");
     // No stride is provided
     if (strides_it == array.cend() || IsA<Null>(strides_it->second)) {
@@ -335,11 +335,13 @@ template <>
 struct ToDType<double> {
   static constexpr ArrayInterfaceHandler::Type kType = ArrayInterfaceHandler::kF8;
 };
+// NumPy's 128-bit floating-point array interface maps to long double on supported hosts.
+// NOLINTBEGIN(google-runtime-float)
 template <typename T>
-struct ToDType<T,
-               std::enable_if_t<std::is_same<T, long double>::value && sizeof(long double) == 16>> {
+struct ToDType<T, std::enable_if_t<std::is_same_v<T, long double> && sizeof(long double) == 16>> {
   static constexpr ArrayInterfaceHandler::Type kType = ArrayInterfaceHandler::kF16;
 };
+// NOLINTEND(google-runtime-float)
 // uint
 template <>
 struct ToDType<uint8_t> {
@@ -408,9 +410,14 @@ class ArrayInterface {
     ArrayInterfaceHandler::Validate(array);
 
     auto typestr = get<String const>(array.at("typestr"));
-    this->AssignType(StringView{typestr});
+    this->AssignType(std::string_view{typestr});
     ArrayInterfaceHandler::ExtractShape(array, shape);
-    size_t itemsize = typestr[2] - '0';
+    std::size_t itemsize = 0;
+    if (this->type == ArrayInterfaceHandler::kF16) {
+      itemsize = 16;
+    } else {
+      itemsize = typestr[2] - '0';
+    }
     is_contiguous = ArrayInterfaceHandler::ExtractStride(array, itemsize, shape, strides);
     n = linalg::detail::CalcSize(shape);
 
@@ -419,7 +426,9 @@ class ArrayInterface {
 
     auto alignment = this->ElementAlignment();
     auto ptr = reinterpret_cast<uintptr_t>(this->data);
-    CHECK_EQ(ptr % alignment, 0) << "Input pointer misalignment.";
+    if (!std::all_of(this->shape, this->shape + D, [](auto v) { return v == 0; })) {
+      CHECK_EQ(ptr % alignment, 0) << "Input pointer misalignment.";
+    }
 
     if (allow_mask) {
       common::Span<RBitField8::value_type> s_mask;
@@ -465,7 +474,7 @@ class ArrayInterface {
 
   explicit ArrayInterface(StringView str) : ArrayInterface{Json::Load(str)} {}
 
-  void AssignType(StringView typestr) {
+  void AssignType(std::string_view typestr) {
     using T = ArrayInterfaceHandler::Type;
     if (typestr.size() == 4 && typestr[1] == 'f' && typestr[2] == '1' && typestr[3] == '6') {
       CHECK(sizeof(long double) == 16) << error::NoF128();
@@ -502,8 +511,16 @@ class ArrayInterface {
     }
   }
 
-  [[nodiscard]] XGBOOST_DEVICE std::size_t Shape(size_t i) const { return shape[i]; }
-  [[nodiscard]] XGBOOST_DEVICE std::size_t Stride(size_t i) const { return strides[i]; }
+  template <std::size_t i>
+  [[nodiscard]] XGBOOST_DEVICE std::size_t Shape() const {
+    static_assert(i < D);
+    return shape[i];
+  }
+  template <std::size_t i>
+  [[nodiscard]] XGBOOST_DEVICE std::size_t Stride() const {
+    static_assert(i < D);
+    return strides[i];
+  }
 
   template <typename Fn>
   XGBOOST_HOST_DEV_INLINE decltype(auto) DispatchCall(Fn func) const {
@@ -526,7 +543,7 @@ class ArrayInterface {
       }
 #else
       case T::kF16:
-        return func(reinterpret_cast<long double const *>(data));
+        return func(reinterpret_cast<long double const *>(data));  // NOLINT
 #endif
       case T::kI1:
         return func(reinterpret_cast<int8_t const *>(data));
@@ -556,7 +573,7 @@ class ArrayInterface {
   }
   [[nodiscard]] XGBOOST_DEVICE std::size_t ElementAlignment() const {
     return this->DispatchCall([](auto *typed_data_ptr) {
-      return std::alignment_of<std::remove_pointer_t<decltype(typed_data_ptr)>>::value;
+      return std::alignment_of_v<std::remove_pointer_t<decltype(typed_data_ptr)>>;
     });
   }
 
@@ -568,9 +585,8 @@ class ArrayInterface {
 #if defined(XGBOOST_USE_CUDA)
       // No operator defined for half -> size_t
       using Type = std::conditional_t<
-          std::is_same<__half,
-                       std::remove_cv_t<std::remove_pointer_t<decltype(p_values)>>>::value &&
-              std::is_same<std::size_t, std::remove_cv_t<T>>::value,
+          std::is_same_v<__half, std::remove_cv_t<std::remove_pointer_t<decltype(p_values)>>> &&
+              std::is_same_v<std::size_t, std::remove_cv_t<T>>,
           unsigned long long, T>;  // NOLINT
       return static_cast<T>(static_cast<Type>(p_values[offset]));
 #else
@@ -613,9 +629,14 @@ auto DispatchDType(ArrayInterfaceHandler::Type dtype, Fn dispatch) {
       return dispatch(double{});
     }
     case ArrayInterfaceHandler::kF16: {
-      using T = long double;
+      using T = long double;  // NOLINT
       CHECK(sizeof(T) == 16) << error::NoF128();
-      return dispatch(T{});
+      // Avoid invalid type.
+      if constexpr (sizeof(T) == 16) {
+        return dispatch(T{});
+      } else {
+        return dispatch(double{});
+      }
     }
     case ArrayInterfaceHandler::kI1: {
       return dispatch(std::int8_t{});

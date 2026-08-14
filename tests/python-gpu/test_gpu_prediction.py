@@ -1,25 +1,18 @@
 import sys
 from copy import copy
+from typing import Any, Dict, Type
 
 import numpy as np
 import pytest
-from hypothesis import assume, given, settings, strategies
-
 import xgboost as xgb
+from hypothesis import assume, given, settings, strategies
+from hypothesis.extra.pandas import column, data_frames, range_indexes
 from xgboost import testing as tm
-from xgboost.compat import PANDAS_INSTALLED
-
-if PANDAS_INSTALLED:
-    from hypothesis.extra.pandas import column, data_frames, range_indexes
-else:
-
-    def noop(*args, **kwargs):
-        pass
-
-    column, data_frames, range_indexes = noop, noop, noop
+from xgboost.compat import import_cupy
+from xgboost.testing.predict import run_base_margin_vs_base_score, run_predict_leaf
 
 sys.path.append("tests/python")
-from test_predict import run_predict_leaf  # noqa
+
 from test_predict import run_threaded_predict  # noqa
 
 rng = np.random.RandomState(1994)
@@ -40,11 +33,11 @@ predict_parameter_strategy = strategies.fixed_dictionaries(
 )
 
 # cupy nvrtc compilation can take a long time for the first run
-pytestmark = tm.timeout(30)
+pytestmark = tm.timeout(60)
 
 
 class TestGPUPredict:
-    def test_predict(self):
+    def test_predict(self) -> None:
         iterations = 10
         np.random.seed(1)
         test_num_rows = [10, 1000, 5000]
@@ -68,7 +61,7 @@ class TestGPUPredict:
                     label=[0, 1] * int(num_rows / 2),
                 )
                 watchlist = [(dtrain, "train"), (dval, "validation")]
-                res = {}
+                res: Dict[str, Any] = {}
                 param = {
                     "objective": "binary:logistic",
                     "eval_metric": "logloss",
@@ -98,7 +91,7 @@ class TestGPUPredict:
     # Test case for a bug where multiple batch predictions made on a
     # test set produce incorrect results
     @pytest.mark.skipif(**tm.no_sklearn())
-    def test_multi_predict(self):
+    def test_multi_predict(self) -> None:
         from sklearn.datasets import make_regression
         from sklearn.model_selection import train_test_split
 
@@ -123,7 +116,7 @@ class TestGPUPredict:
         assert np.allclose(predict_gpu_0, predict_cpu)
 
     @pytest.mark.skipif(**tm.no_sklearn())
-    def test_sklearn(self):
+    def test_sklearn(self) -> None:
         m, n = 15000, 14
         tr_size = 2500
         X = np.random.rand(m, n)
@@ -162,10 +155,10 @@ class TestGPUPredict:
 
         """
         import cudf
-        import cupy as cp
         import pandas as pd
         from scipy.sparse import csr_matrix
 
+        cp = import_cupy()
         reg = xgb.XGBRegressor(tree_method="hist", device=device)
         n_samples = 4096
         n_features = 13
@@ -193,9 +186,14 @@ class TestGPUPredict:
         np.testing.assert_allclose(predt_0, predt_4)
 
     def run_inplace_base_margin(
-        self, device: int, booster: xgb.Booster, dtrain: xgb.DMatrix, X, base_margin
+        self,
+        device: int,
+        booster: xgb.Booster,
+        dtrain: xgb.DMatrix,
+        X: Any,
+        base_margin: Any,
     ) -> None:
-        import cupy as cp
+        cp = import_cupy()
 
         booster.set_param({"device": f"cuda:{device}"})
         dtrain.set_info(base_margin=base_margin)
@@ -226,7 +224,7 @@ class TestGPUPredict:
         cols = 10
         missing = 11  # set to integer for testing
 
-        cp_rng = cp.random.RandomState(1994)
+        cp_rng = cp.random.RandomState(np.uint64(1994))
         cp.random.set_random_state(cp_rng)
 
         X = cp.random.randn(rows, cols)
@@ -247,7 +245,7 @@ class TestGPUPredict:
         predt_from_dmatrix = booster.predict(test)
         cp.testing.assert_allclose(predt_from_array, predt_from_dmatrix)
 
-        def predict_dense(x):
+        def predict_dense(x: cp.ndarray) -> bool:
             cp.cuda.runtime.setDevice(device)
             inplace_predt = booster.inplace_predict(x)
             d = xgb.DMatrix(x)
@@ -284,13 +282,13 @@ class TestGPUPredict:
         cp.cuda.runtime.setDevice(0)
 
     @pytest.mark.skipif(**tm.no_cupy())
-    def test_inplace_predict_cupy(self):
+    def test_inplace_predict_cupy(self) -> None:
         self.run_inplace_predict_cupy(0)
 
     @pytest.mark.skipif(**tm.no_cupy())
     @pytest.mark.mgpu
-    def test_inplace_predict_cupy_specified_device(self):
-        import cupy as cp
+    def test_inplace_predict_cupy_specified_device(self) -> None:
+        cp = import_cupy()
 
         n_devices = cp.cuda.runtime.getDeviceCount()
         for d in range(n_devices):
@@ -298,19 +296,19 @@ class TestGPUPredict:
 
     @pytest.mark.skipif(**tm.no_cupy())
     @pytest.mark.skipif(**tm.no_cudf())
-    def test_inplace_predict_cudf(self):
+    def test_inplace_predict_cudf(self) -> None:
         import cudf
-        import cupy as cp
         import pandas as pd
 
+        cp = import_cupy()
         rows = 1000
         cols = 10
         rng = np.random.RandomState(1994)
         cp.cuda.runtime.setDevice(0)
-        X = rng.randn(rows, cols)
-        X = pd.DataFrame(X)
+        X_np = rng.randn(rows, cols)
+        X_pd = pd.DataFrame(X_np)
         y = rng.randn(rows)
-        X = cudf.from_pandas(X)
+        X = cudf.from_pandas(X_pd)
 
         dtrain = xgb.DMatrix(X, y)
 
@@ -323,7 +321,7 @@ class TestGPUPredict:
 
         cp.testing.assert_allclose(predt_from_array, predt_from_dmatrix)
 
-        def predict_df(x):
+        def predict_df(x: cudf.DataFrame) -> bool:
             # column major array
             inplace_predt = booster.inplace_predict(x.values)
             d = xgb.DMatrix(x)
@@ -343,17 +341,26 @@ class TestGPUPredict:
         strategies.integers(1, 10), tm.make_dataset_strategy(), shap_parameter_strategy
     )
     @settings(deadline=None, max_examples=20, print_blob=True)
-    def test_shap(self, num_rounds, dataset, param):
+    @pytest.mark.timeout(120)
+    def test_shap(self, num_rounds: int, dataset: tm.TestDataset, param: dict) -> None:
         if dataset.name.endswith("-l1"):  # not supported by the exact tree method
             return
         param.update({"tree_method": "hist", "device": "gpu:0"})
         param = dataset.set_params(param)
         dmat = dataset.get_dmat()
         bst = xgb.train(param, dmat, num_rounds)
-        test_dmat = xgb.DMatrix(dataset.X, dataset.y, dataset.w, dataset.margin)
+        test_dmat = xgb.DMatrix(
+            dataset.X, dataset.y, weight=dataset.w, base_margin=dataset.margin
+        )
         bst.set_param({"device": "gpu:0"})
         shap = bst.predict(test_dmat, pred_contribs=True)
         margin = bst.predict(test_dmat, output_margin=True)
+        assume(len(dataset.y) > 0)
+        assert np.allclose(np.sum(shap, axis=len(shap.shape) - 1), margin, 1e-3, 1e-3)
+
+        dmat = dataset.get_external_dmat()
+        shap = bst.predict(dmat, pred_contribs=True)
+        margin = bst.predict(dmat, output_margin=True)
         assume(len(dataset.y) > 0)
         assert np.allclose(np.sum(shap, axis=len(shap.shape) - 1), margin, 1e-3, 1e-3)
 
@@ -361,14 +368,20 @@ class TestGPUPredict:
         strategies.integers(1, 10), tm.make_dataset_strategy(), shap_parameter_strategy
     )
     @settings(deadline=None, max_examples=10, print_blob=True)
-    def test_shap_interactions(self, num_rounds, dataset, param):
+    @pytest.mark.timeout(120)
+    def test_shap_interactions(
+        self, num_rounds: int, dataset: tm.TestDataset, param: dict
+    ) -> None:
         if dataset.name.endswith("-l1"):  # not supported by the exact tree method
             return
         param.update({"tree_method": "hist", "device": "cuda:0"})
         param = dataset.set_params(param)
         dmat = dataset.get_dmat()
         bst = xgb.train(param, dmat, num_rounds)
-        test_dmat = xgb.DMatrix(dataset.X, dataset.y, dataset.w, dataset.margin)
+
+        test_dmat = xgb.DMatrix(
+            dataset.X, dataset.y, weight=dataset.w, base_margin=dataset.margin
+        )
         bst.set_param({"device": "cuda:0"})
         shap = bst.predict(test_dmat, pred_interactions=True)
         margin = bst.predict(test_dmat, output_margin=True)
@@ -380,9 +393,20 @@ class TestGPUPredict:
             1e-3,
         )
 
-    def test_shap_categorical(self):
-        X, y = tm.make_categorical(100, 20, 7, False)
-        Xy = xgb.DMatrix(X, y, enable_categorical=True)
+        test_dmat = dataset.get_external_dmat()
+        shap = bst.predict(test_dmat, pred_interactions=True)
+        margin = bst.predict(test_dmat, output_margin=True)
+        assume(len(dataset.y) > 0)
+        assert np.allclose(
+            np.sum(shap, axis=(len(shap.shape) - 1, len(shap.shape) - 2)),
+            margin,
+            1e-3,
+            1e-3,
+        )
+
+    def test_shap_categorical(self) -> None:
+        X, y = tm.make_categorical(100, 20, 7, onehot=False)
+        Xy = xgb.DMatrix(X, y)
         booster = xgb.train(
             {"tree_method": "hist", "device": "gpu:0"}, Xy, num_boost_round=10
         )
@@ -401,12 +425,21 @@ class TestGPUPredict:
             np.sum(shap, axis=len(shap.shape) - 1), margin, rtol=1e-3
         )
 
-    def test_predict_leaf_basic(self):
-        gpu_leaf = run_predict_leaf("gpu:0")
-        cpu_leaf = run_predict_leaf("cpu")
+    @pytest.mark.parametrize(
+        "DMatrixT", [xgb.DMatrix, xgb.QuantileDMatrix, xgb.ExtMemQuantileDMatrix]
+    )
+    def test_predict_leaf_basic(self, DMatrixT: Type[xgb.DMatrix]) -> None:
+        gpu_leaf = run_predict_leaf("cuda", DMatrixT)
+        cpu_leaf = run_predict_leaf("cpu", DMatrixT)
         np.testing.assert_equal(gpu_leaf, cpu_leaf)
 
-    def run_predict_leaf_booster(self, param, num_rounds, dataset):
+    def run_predict_leaf_booster(
+        self,
+        param: Dict[str, Any],
+        num_rounds: int,
+        dataset: tm.TestDataset,
+        DMatrixT: Type[xgb.DMatrix],
+    ) -> None:
         param = dataset.set_params(param)
         m = dataset.get_dmat()
         booster = xgb.train(
@@ -420,15 +453,25 @@ class TestGPUPredict:
 
         np.testing.assert_equal(cpu_leaf, gpu_leaf)
 
-    @given(predict_parameter_strategy, tm.make_dataset_strategy())
+    @given(
+        predict_parameter_strategy,
+        tm.make_dataset_strategy(),
+        strategies.fixed_dictionaries(
+            {
+                "DMatrixT": strategies.sampled_from([xgb.DMatrix, xgb.QuantileDMatrix]),
+            }
+        ),
+    )
     @settings(deadline=None, max_examples=20, print_blob=True)
-    def test_predict_leaf_gbtree(self, param: dict, dataset: tm.TestDataset) -> None:
+    def test_predict_leaf_gbtree(
+        self, param: dict, dataset: tm.TestDataset, DMatrixT: Type[xgb.DMatrix]
+    ) -> None:
         # Unsupported for random forest
         if param.get("num_parallel_tree", 1) > 1 and dataset.name.endswith("-l1"):
             return
 
         param.update({"booster": "gbtree", "tree_method": "hist", "device": "cuda:0"})
-        self.run_predict_leaf_booster(param, 10, dataset)
+        self.run_predict_leaf_booster(param, 10, dataset, DMatrixT)
 
     @given(predict_parameter_strategy, tm.make_dataset_strategy())
     @settings(deadline=None, max_examples=20, print_blob=True)
@@ -438,7 +481,7 @@ class TestGPUPredict:
             return
 
         param.update({"booster": "dart", "tree_method": "hist", "device": "cuda:0"})
-        self.run_predict_leaf_booster(param, 10, dataset)
+        self.run_predict_leaf_booster(param, 10, dataset, xgb.DMatrix)
 
     @pytest.mark.skipif(**tm.no_sklearn())
     @pytest.mark.skipif(**tm.no_pandas())
@@ -452,13 +495,13 @@ class TestGPUPredict:
         )
     )
     @settings(deadline=None, max_examples=20, print_blob=True)
-    def test_predict_categorical_split(self, df):
-        from sklearn.metrics import mean_squared_error
+    def test_predict_categorical_split(self, df: Any) -> None:
+        from sklearn.metrics import root_mean_squared_error
 
         df = df.astype("category")
         x0, x1 = df["x0"].to_numpy(), df["x1"].to_numpy()
         y = (x0 * 10 - 20) + (x1 - 2)
-        dtrain = xgb.DMatrix(df, label=y, enable_categorical=True)
+        dtrain = xgb.DMatrix(df, label=y)
 
         params = {
             "tree_method": "hist",
@@ -469,7 +512,7 @@ class TestGPUPredict:
             "device": "cuda:0",
         }
 
-        eval_history = {}
+        eval_history: Dict[str, Any] = {}
         bst = xgb.train(
             params,
             dtrain,
@@ -480,17 +523,17 @@ class TestGPUPredict:
         )
         bst.set_param({"device": "cuda:0"})
         pred = bst.predict(dtrain)
-        rmse = mean_squared_error(y_true=y, y_pred=pred, squared=False)
+        rmse = root_mean_squared_error(y_true=y, y_pred=pred)
         np.testing.assert_almost_equal(
             rmse, eval_history["train"]["rmse"][-1], decimal=5
         )
 
     @pytest.mark.skipif(**tm.no_cupy())
     @pytest.mark.parametrize("n_classes", [2, 3])
-    def test_predict_dart(self, n_classes):
-        import cupy as cp
+    def test_predict_dart(self, n_classes: int) -> None:
         from sklearn.datasets import make_classification
 
+        cp = import_cupy()
         n_samples = 1000
         X_, y_ = make_classification(
             n_samples=n_samples, n_informative=5, n_classes=n_classes
@@ -541,14 +584,15 @@ class TestGPUPredict:
         cp.testing.assert_allclose(inplace, copied, atol=1e-6)
 
     @pytest.mark.skipif(**tm.no_cupy())
-    def test_dtypes(self):
-        import cupy as cp
+    def test_dtypes(self) -> None:
+        cp = import_cupy()
 
         rows = 1000
         cols = 10
-        rng = cp.random.RandomState(1994)
-        orig = rng.randint(low=0, high=127, size=rows * cols).reshape(rows, cols)
-        y = rng.randint(low=0, high=127, size=rows)
+
+        rng = cp.random.default_rng(1994)
+        orig = rng.integers(low=0, high=127, size=rows * cols).reshape(rows, cols)
+        y = rng.integers(low=0, high=127, size=rows)
         dtrain = xgb.DMatrix(orig, label=y)
         booster = xgb.train({"tree_method": "hist", "device": "cuda:0"}, dtrain)
 
@@ -576,10 +620,10 @@ class TestGPUPredict:
         # boolean
         orig = cp.random.binomial(1, 0.5, size=rows * cols).reshape(rows, cols)
         predt_orig = booster.inplace_predict(orig)
-        for dtype in [cp.bool8, cp.bool_]:
-            X = cp.array(orig, dtype=dtype)
-            predt = booster.inplace_predict(X)
-            cp.testing.assert_allclose(predt, predt_orig)
+
+        X = cp.array(orig, dtype=cp.bool_)
+        predt = booster.inplace_predict(X)
+        cp.testing.assert_allclose(predt, predt_orig)
 
         # unsupported types
         for dtype in [
@@ -589,3 +633,48 @@ class TestGPUPredict:
             X = cp.array(orig, dtype=dtype)
             with pytest.raises(ValueError):
                 booster.inplace_predict(X)
+
+
+def test_base_margin_vs_base_score() -> None:
+    run_base_margin_vs_base_score("cuda")
+
+
+@pytest.mark.skipif(**tm.no_sklearn())
+def test_shap_multiclass() -> None:
+    from sklearn.datasets import make_classification
+
+    X, y = make_classification(n_classes=3, random_state=2025, n_informative=16)
+    param = {
+        "tree_method": "hist",
+        "device": "cuda",
+        "num_class": 3,
+        "base_score": [1.0, 2.0, 3.0],
+    }
+    Xy = xgb.DMatrix(X, y)
+    bst = xgb.train(param, Xy, 8)
+
+    d_shap = bst.predict(Xy, pred_contribs=True)
+    d_margin = bst.predict(Xy, output_margin=True)
+
+    bst.set_param({"device": "cpu"})
+
+    h_shap = bst.predict(Xy, pred_contribs=True)
+    h_margin = bst.predict(Xy, output_margin=True)
+
+    np.testing.assert_allclose(d_shap, h_shap, atol=1e-6)
+    np.testing.assert_allclose(d_margin, h_margin, atol=1e-6)
+
+    # Compare base margin and base score
+    margin = np.stack(
+        [
+            np.ones(X.shape[0]),
+            np.full(X.shape[0], fill_value=2.0),
+            np.full(X.shape[0], fill_value=3.0),
+        ],
+        axis=1,
+    )
+    Xy = xgb.DMatrix(X, y, base_margin=margin)
+
+    bst.set_param({"device": "cuda"})
+    d_shap = bst.predict(Xy, pred_contribs=True)
+    np.testing.assert_allclose(d_shap, h_shap, atol=1e-6)

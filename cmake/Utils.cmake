@@ -13,45 +13,6 @@ function(auto_source_group SOURCES)
   endforeach()
 endfunction()
 
-# Force static runtime for MSVC
-function(msvc_use_static_runtime)
-  if(MSVC AND (NOT BUILD_SHARED_LIBS) AND (NOT FORCE_SHARED_CRT))
-      set(variables
-          CMAKE_C_FLAGS_DEBUG
-          CMAKE_C_FLAGS_MINSIZEREL
-          CMAKE_C_FLAGS_RELEASE
-          CMAKE_C_FLAGS_RELWITHDEBINFO
-          CMAKE_CXX_FLAGS_DEBUG
-          CMAKE_CXX_FLAGS_MINSIZEREL
-          CMAKE_CXX_FLAGS_RELEASE
-          CMAKE_CXX_FLAGS_RELWITHDEBINFO
-      )
-      foreach(variable ${variables})
-          if(${variable} MATCHES "/MD")
-              string(REGEX REPLACE "/MD" "/MT" ${variable} "${${variable}}")
-              set(${variable} "${${variable}}"  PARENT_SCOPE)
-          endif()
-      endforeach()
-      set(variables
-          CMAKE_CUDA_FLAGS
-          CMAKE_CUDA_FLAGS_DEBUG
-          CMAKE_CUDA_FLAGS_MINSIZEREL
-          CMAKE_CUDA_FLAGS_RELEASE
-          CMAKE_CUDA_FLAGS_RELWITHDEBINFO
-      )
-      foreach(variable ${variables})
-          if(${variable} MATCHES "-MD")
-              string(REGEX REPLACE "-MD" "-MT" ${variable} "${${variable}}")
-              set(${variable} "${${variable}}"  PARENT_SCOPE)
-          endif()
-          if(${variable} MATCHES "/MD")
-              string(REGEX REPLACE "/MD" "/MT" ${variable} "${${variable}}")
-              set(${variable} "${${variable}}"  PARENT_SCOPE)
-          endif()
-      endforeach()
-  endif()
-endfunction()
-
 # Set output directory of target, ignoring debug or release
 function(set_output_directory target dir)
   set_target_properties(${target} PROPERTIES
@@ -82,19 +43,46 @@ function(set_default_configuration_release)
     endif()
 endfunction()
 
+if(BUILD_WITH_GIT_HASH)
+  execute_process(COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${xgboost_SOURCE_DIR}
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE XGBOOST_GIT_HASH
+    ERROR_VARIABLE XGBOOST_GIT_ERROR
+    RESULT_VARIABLE GIT_COMMAND_RESULT)
+
+  if(NOT GIT_COMMAND_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to retrieve the git hash:\n${XGBOOST_GIT_ERROR}")
+  endif()
+  message(STATUS "Git hash: ${XGBOOST_GIT_HASH}")
+endif()
+
 # Generate CMAKE_CUDA_ARCHITECTURES form a list of architectures
 # Also generates PTX for the most recent architecture for forwards compatibility
 function(compute_cmake_cuda_archs archs)
-  if(CMAKE_CUDA_COMPILER_VERSION MATCHES "^([0-9]+\\.[0-9]+)")
+  if(CMAKE_CUDA_COMPILER_TOOLKIT_VERSION MATCHES "^([0-9]+\\.[0-9]+)")
+    set(CUDA_VERSION "${CMAKE_MATCH_1}")
+  elseif(CMAKE_CUDA_COMPILER_VERSION MATCHES "^([0-9]+\\.[0-9]+)")
     set(CUDA_VERSION "${CMAKE_MATCH_1}")
   endif()
-  list(SORT archs)
+  # NATURAL sort is needed so that 3-digit archs (100, 120) sort *after*
+  # 2-digit ones (70, 90). With the default STRING sort, "100" precedes "70"
+  # alphabetically, which caused the -virtual (PTX) entry below — applied to
+  # the AT -1 position — to land on the wrong architecture.
+  list(SORT archs COMPARE NATURAL)
   unset(CMAKE_CUDA_ARCHITECTURES CACHE)
   set(CMAKE_CUDA_ARCHITECTURES ${archs})
 
   # Set up defaults based on CUDA varsion
+  # Remember to update arch-specific tunings when supporting new archs.
   if(NOT CMAKE_CUDA_ARCHITECTURES)
-    if(CUDA_VERSION VERSION_GREATER_EQUAL "11.8")
+    if(CUDA_VERSION VERSION_GREATER_EQUAL "13.0")
+      set(CMAKE_CUDA_ARCHITECTURES 75 80 90 100 120)
+    elseif(CUDA_VERSION VERSION_GREATER_EQUAL "12.9")
+      set(CMAKE_CUDA_ARCHITECTURES 75 80 90 100 120)
+    elseif(CUDA_VERSION VERSION_GREATER_EQUAL "12.8")
+      set(CMAKE_CUDA_ARCHITECTURES 50 60 70 80 90 100 120)
+    elseif(CUDA_VERSION VERSION_GREATER_EQUAL "11.8")
       set(CMAKE_CUDA_ARCHITECTURES 50 60 70 80 90)
     elseif(CUDA_VERSION VERSION_GREATER_EQUAL "11.0")
       set(CMAKE_CUDA_ARCHITECTURES 50 60 70 80)
@@ -113,49 +101,99 @@ function(compute_cmake_cuda_archs archs)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES: ${CMAKE_CUDA_ARCHITECTURES}")
 endfunction()
 
+function(xgboost_cuda_wrap_host_compiler_options out_var)
+  set(wrapped "")
+  foreach(flag IN LISTS ARGN)
+    if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+      list(APPEND wrapped "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${flag}>")
+    elseif(CMAKE_CUDA_COMPILER_ID STREQUAL "Clang")
+      list(APPEND wrapped "$<$<COMPILE_LANGUAGE:CUDA>:${flag}>")
+    else()
+      message(FATAL_ERROR "Unsupported CUDA compiler: ${CMAKE_CUDA_COMPILER_ID}")
+    endif()
+  endforeach()
+  set(${out_var} "${wrapped}" PARENT_SCOPE)
+endfunction()
+
 # Set CUDA related flags to target.  Must be used after code `format_gencode_flags`.
 function(xgboost_set_cuda_flags target)
-  target_compile_options(${target} PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${OpenMP_CXX_FLAGS}>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+  set(cuda_compile_options "")
+  set(cuda_compile_definitions "")
+  set(cuda_device_debug_options "")
+  set(cuda_lineinfo_option "")
 
-  if(USE_PER_THREAD_DEFAULT_STREAM)
-    target_compile_options(${target} PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:--default-stream per-thread>)
+  if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    list(APPEND cuda_compile_options
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>
+      $<$<COMPILE_LANGUAGE:CUDA>:--default-stream per-thread>
+    )
+    set(cuda_device_debug_options
+      $<$<AND:$<CONFIG:DEBUG>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>)
+    set(cuda_lineinfo_option $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+  elseif(CMAKE_CUDA_COMPILER_ID STREQUAL "Clang")
+    list(APPEND cuda_compile_options
+      $<$<COMPILE_LANGUAGE:CUDA>:-Wno-unknown-cuda-version>
+    )
+    list(APPEND cuda_compile_definitions
+      $<$<COMPILE_LANGUAGE:CUDA>:CUDA_API_PER_THREAD_DEFAULT_STREAM=1>
+    )
+    set(cuda_device_debug_options
+      $<$<AND:$<CONFIG:DEBUG>,$<COMPILE_LANGUAGE:CUDA>>:--cuda-noopt-device-debug>)
+    set(cuda_lineinfo_option $<$<COMPILE_LANGUAGE:CUDA>:-gline-tables-only>)
+  else()
+    message(FATAL_ERROR "Unsupported CUDA compiler: ${CMAKE_CUDA_COMPILER_ID}")
+  endif()
+
+  if(OpenMP_CXX_FLAGS)
+    separate_arguments(cuda_openmp_flags NATIVE_COMMAND "${OpenMP_CXX_FLAGS}")
+    xgboost_cuda_wrap_host_compiler_options(cuda_host_flags ${cuda_openmp_flags})
+    list(APPEND cuda_compile_options ${cuda_host_flags})
+  endif()
+
+  target_compile_options(${target} PRIVATE ${cuda_compile_options})
+  if(cuda_compile_definitions)
+    target_compile_definitions(${target} PRIVATE ${cuda_compile_definitions})
   endif()
 
   if(FORCE_COLORED_OUTPUT)
     if(FORCE_COLORED_OUTPUT AND (CMAKE_GENERATOR STREQUAL "Ninja") AND
         ((CMAKE_CXX_COMPILER_ID STREQUAL "GNU") OR
           (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")))
-      target_compile_options(${target} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fdiagnostics-color=always>)
+      xgboost_cuda_wrap_host_compiler_options(cuda_color_flags -fdiagnostics-color=always)
+      target_compile_options(${target} PRIVATE ${cuda_color_flags})
     endif()
   endif()
 
   if(USE_DEVICE_DEBUG)
-    target_compile_options(${target} PRIVATE
-      $<$<AND:$<CONFIG:DEBUG>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>)
-  else()
-    target_compile_options(${target} PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_compile_options(${target} PRIVATE ${cuda_device_debug_options})
   endif()
 
   if(USE_NVTX)
     target_compile_definitions(${target} PRIVATE -DXGBOOST_USE_NVTX=1)
+    if(NOT USE_DEVICE_DEBUG)
+      target_compile_options(${target} PRIVATE ${cuda_lineinfo_option})
+    endif()
   endif()
 
+  # Use CCCL we find before CUDA Toolkit to make sure we get newer headers as intended
+  # The CUDA Toolkit includes its own copy of CCCL that often lags the latest releases
+  # (and would be picked up otherwise)
+  if(BUILD_STATIC_LIB)
+    # If the downstream user is statically linking with libxgboost, it needs to
+    # explicitly link with CCCL and CUDA runtime.
+    target_link_libraries(${target}
+      PUBLIC CCCL::CCCL CUDA::cudart_static)
+  else()
+    # If the downstream user is dynamically linking with libxgboost, it does not
+    # need to link with CCCL and CUDA runtime.
+    target_link_libraries(${target} PRIVATE CCCL::CCCL CUDA::cudart_static)
+  endif()
   target_compile_definitions(${target} PRIVATE -DXGBOOST_USE_CUDA=1)
-  target_include_directories(
-    ${target} PRIVATE
-    ${xgboost_SOURCE_DIR}/gputreeshap
-    ${CUDAToolkit_INCLUDE_DIRS})
-
   if(MSVC)
-    target_compile_options(${target} PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+    xgboost_cuda_wrap_host_compiler_options(cuda_utf8_flags /utf-8)
+    target_compile_options(${target} PRIVATE ${cuda_utf8_flags})
   endif()
 
   set_target_properties(${target} PROPERTIES
@@ -175,18 +213,15 @@ function(xgboost_link_nccl target)
   set(xgboost_nccl_flags -DXGBOOST_USE_NCCL=1)
   if(USE_DLOPEN_NCCL)
     list(APPEND xgboost_nccl_flags -DXGBOOST_USE_DLOPEN_NCCL=1)
+    target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
   endif()
 
   if(BUILD_STATIC_LIB)
-    target_include_directories(${target} PUBLIC ${NCCL_INCLUDE_DIR})
     target_compile_definitions(${target} PUBLIC ${xgboost_nccl_flags})
-    target_link_libraries(${target} PUBLIC ${NCCL_LIBRARY})
+    target_link_libraries(${target} PUBLIC nccl::nccl)
   else()
-    target_include_directories(${target} PRIVATE ${NCCL_INCLUDE_DIR})
     target_compile_definitions(${target} PRIVATE ${xgboost_nccl_flags})
-    if(NOT USE_DLOPEN_NCCL)
-      target_link_libraries(${target} PRIVATE ${NCCL_LIBRARY})
-    endif()
+    target_link_libraries(${target} PRIVATE nccl::nccl)
   endif()
 endfunction()
 
@@ -208,10 +243,15 @@ macro(xgboost_target_properties target)
 
   if(ENABLE_ALL_WARNINGS)
     target_compile_options(${target} PUBLIC
-      $<IF:$<COMPILE_LANGUAGE:CUDA>,
-      -Xcompiler=-Wall -Xcompiler=-Wextra -Xcompiler=-Wno-expansion-to-defined,
-      -Wall -Wextra -Wno-expansion-to-defined>
-    )
+      $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-Wall>
+      $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-Wextra>
+      $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-Wno-expansion-to-defined>)
+    if(USE_CUDA)
+      xgboost_cuda_wrap_host_compiler_options(
+        cuda_warning_flags -Wall -Wextra -Wno-expansion-to-defined
+      )
+      target_compile_options(${target} PUBLIC ${cuda_warning_flags})
+    endif()
   endif()
 
   target_compile_options(${target}
@@ -229,6 +269,13 @@ macro(xgboost_target_properties target)
 
   if(WIN32 AND MINGW)
     target_compile_options(${target} PUBLIC -static-libstdc++)
+  endif()
+
+  if(NOT WIN32 AND ENABLE_ALL_WARNINGS AND USE_CUDA AND
+      CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Werror=cross-execution-space-call>
+    )
   endif()
 endmacro()
 
@@ -257,14 +304,23 @@ macro(xgboost_target_defs target)
   if(PLUGIN_RMM)
     target_compile_definitions(objxgboost PUBLIC -DXGBOOST_USE_RMM=1)
   endif()
+
+  if(USE_NVCOMP)
+    target_compile_definitions(objxgboost PUBLIC -DXGBOOST_USE_NVCOMP=1)
+  endif()
+  if(BUILD_WITH_GIT_HASH)
+    target_compile_definitions(objxgboost PUBLIC -DXGBOOST_GIT_HASH="${XGBOOST_GIT_HASH}")
+  endif()
 endmacro()
 
 # handles dependencies
 macro(xgboost_target_link_libraries target)
-  if(BUILD_STATIC_LIB)
-    target_link_libraries(${target} PUBLIC Threads::Threads ${CMAKE_THREAD_LIBS_INIT})
-  else()
-    target_link_libraries(${target} PRIVATE Threads::Threads ${CMAKE_THREAD_LIBS_INIT})
+  if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Emscripten"))
+    if(BUILD_STATIC_LIB)
+      target_link_libraries(${target} PUBLIC Threads::Threads ${CMAKE_THREAD_LIBS_INIT})
+    else()
+      target_link_libraries(${target} PRIVATE Threads::Threads ${CMAKE_THREAD_LIBS_INIT})
+    endif()
   endif()
 
   if(USE_OPENMP)
@@ -277,11 +333,14 @@ macro(xgboost_target_link_libraries target)
 
   if(USE_CUDA)
     xgboost_set_cuda_flags(${target})
-    target_link_libraries(${target} PUBLIC CUDA::cudart_static)
   endif()
 
   if(PLUGIN_RMM)
     target_link_libraries(${target} PRIVATE rmm::rmm)
+  endif()
+
+  if(USE_NVCOMP)
+    target_link_libraries(${target} PRIVATE nvcomp::nvcomp)
   endif()
 
   if(USE_NCCL)

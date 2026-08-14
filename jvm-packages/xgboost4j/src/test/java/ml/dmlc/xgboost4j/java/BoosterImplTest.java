@@ -107,6 +107,47 @@ public class BoosterImplTest {
   }
 
   @Test
+  public void testSetParamsAsBatch() throws XGBoostError {
+    DMatrix trainMat = new DMatrix(this.train_uri);
+    Map<String, Object> params = new LinkedHashMap<>();
+    // This order is invalid when each parameter triggers configuration independently.
+    params.put("objective", "multi:softprob");
+    params.put("num_class", 3);
+
+    Map<String, DMatrix> watches = new HashMap<>();
+    watches.put("train", trainMat);
+
+    Booster booster = XGBoost.train(trainMat, params, 1, watches, null, null);
+    float[][] predictions = booster.predict(trainMat);
+    TestCase.assertEquals(3, predictions[0].length);
+  }
+
+  @Test
+  public void testPredictionIterationEnd() throws XGBoostError {
+    DMatrix trainMat = new DMatrix(this.train_uri);
+    DMatrix testMat = new DMatrix(this.test_uri);
+    Map<String, Object> params = new HashMap<String, Object>() {
+      {
+        put("max_depth", 2);
+        put("objective", "binary:logistic");
+        put("num_parallel_tree", 3);
+      }
+    };
+    HashMap<String, DMatrix> watches = new HashMap<String, DMatrix>() {
+      {
+        put("train", trainMat);
+      }
+    };
+
+    Booster booster = XGBoost.train(trainMat, params, 2, watches, null, null);
+    float[][] firstIteration = booster.predictLeaf(testMat, 1);
+    float[][] allIterations = booster.predictLeaf(testMat, 0);
+
+    TestCase.assertEquals(3, firstIteration[0].length);
+    TestCase.assertEquals(6, allIterations[0].length);
+  }
+
+  @Test
   public void inplacePredictTest() throws XGBoostError {
     /* Data Generation */
     // Generate a training set.
@@ -294,7 +335,6 @@ public class BoosterImplTest {
     Booster bst2 = XGBoost.loadModel(temp.getAbsolutePath());
     assert (Arrays.equals(bst2.toByteArray("ubj"), booster.toByteArray("ubj")));
     assert (Arrays.equals(bst2.toByteArray("json"), booster.toByteArray("json")));
-    assert (Arrays.equals(bst2.toByteArray("deprecated"), booster.toByteArray("deprecated")));
     float[][] predicts2 = bst2.predict(testMat, true, 0);
     TestCase.assertTrue(eval.eval(predicts2, testMat) < 0.1f);
   }
@@ -327,7 +367,6 @@ public class BoosterImplTest {
     Booster bst2 = XGBoost.loadModel(temp.getAbsolutePath());
     assert (Arrays.equals(bst2.toByteArray("ubj"), booster.toByteArray("ubj")));
     assert (Arrays.equals(bst2.toByteArray("json"), booster.toByteArray("json")));
-    assert (Arrays.equals(bst2.toByteArray("deprecated"), booster.toByteArray("deprecated")));
     float[][] predicts2 = bst2.predict(testMat, true, 0);
     TestCase.assertTrue(eval.eval(predicts2, testMat) < 0.1f);
   }
@@ -898,5 +937,35 @@ public class BoosterImplTest {
 
     Booster booster = trainBooster(trainMat, testMat);
     TestCase.assertEquals(booster.getNumFeature(), 126);
+  }
+
+  @Test
+  public void testConcurrentPredict() throws InterruptedException, XGBoostError, ExecutionException, TimeoutException {
+    DMatrix trainMat = new DMatrix(this.train_uri);
+    DMatrix testMat = new DMatrix(this.test_uri);
+    Booster booster = trainBooster(trainMat, testMat);
+
+    float[][] expectedPredictions = booster.predict(testMat);
+
+    ExecutorService executor = Executors.newFixedThreadPool(10);
+    List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+    //10 threads - each calling predict 50 times
+    for (int t = 0; t < 10; t++) {
+      futures.add(CompletableFuture.runAsync(() -> {
+        try {
+          for (int i = 0; i < 50; i++) {
+            float[][] predictions = booster.predict(testMat);
+            assertArrayEquals(expectedPredictions, predictions);
+          }
+        } catch (XGBoostError e) {
+          throw new RuntimeException(e);
+        }
+      }, executor));
+    }
+
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+      .get(30, TimeUnit.SECONDS);
+    executor.shutdown();
   }
 }

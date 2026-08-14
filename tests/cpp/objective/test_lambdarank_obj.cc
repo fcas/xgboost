@@ -1,28 +1,28 @@
 /**
- * Copyright 2023 by XGBoost Contributors
+ * Copyright 2023-2025, XGBoost Contributors
  */
 #include "test_lambdarank_obj.h"
 
-#include <gtest/gtest.h>                        // for Test, Message, TestPartResult, CmpHel...
+#include <gtest/gtest.h>  // for Test, Message, TestPartResult, CmpHel...
 
-#include <algorithm>                            // for sort
-#include <cstddef>                              // for size_t
-#include <initializer_list>                     // for initializer_list
-#include <map>                                  // for map
-#include <memory>                               // for unique_ptr, shared_ptr, make_shared
-#include <numeric>                              // for iota
-#include <string>                               // for char_traits, basic_string, string
-#include <vector>                               // for vector
+#include <algorithm>         // for sort
+#include <cstddef>           // for size_t
+#include <initializer_list>  // for initializer_list
+#include <memory>            // for unique_ptr, shared_ptr, make_shared
+#include <numeric>           // for iota
+#include <string>            // for char_traits, basic_string, string
+#include <vector>            // for vector
 
-#include "../../../src/common/ranking_utils.h"  // for NDCGCache, LambdaRankParam
-#include "../helpers.h"                         // for CheckRankingObjFunction, CheckConfigReload
-#include "xgboost/base.h"                       // for GradientPair, bst_group_t, Args
-#include "xgboost/context.h"                    // for Context
-#include "xgboost/data.h"                       // for MetaInfo, DMatrix
-#include "xgboost/host_device_vector.h"         // for HostDeviceVector
-#include "xgboost/linalg.h"                     // for Tensor, All, TensorView
-#include "xgboost/objective.h"                  // for ObjFunction
-#include "xgboost/span.h"                       // for Span
+#include "../../../src/common/ranking_utils.h"      // for NDCGCache, LambdaRankParam
+#include "../../../src/objective/lambdarank_obj.h"  // for MAPStat, MakePairs
+#include "../helpers.h"                  // for CheckRankingObjFunction, CheckConfigReload
+#include "xgboost/base.h"                // for GradientPair, bst_group_t, Args
+#include "xgboost/context.h"             // for Context
+#include "xgboost/data.h"                // for MetaInfo, DMatrix
+#include "xgboost/host_device_vector.h"  // for HostDeviceVector
+#include "xgboost/linalg.h"              // for Tensor, All, TensorView
+#include "xgboost/objective.h"           // for ObjFunction
+#include "xgboost/span.h"                // for Span
 
 namespace xgboost::obj {
 TEST(LambdaRank, NDCGJsonIO) {
@@ -56,14 +56,18 @@ void TestNDCGGPair(Context const* ctx) {
                             {0, 2, 4},
                             {2.06611f, -2.06611f, 0.0f, 0.0f},
                             {2.169331f, 2.169331f, 0.0f, 0.0f});
-
-    CheckRankingObjFunction(obj,
-                            {0, 0.1f, 0, 0.1f},
-                            {0,   1, 0, 1},
-                            {2.0f, 2.0f},
-                            {0, 2, 4},
-                            {2.06611f, -2.06611f, 2.06611f, -2.06611f},
-                            {2.169331f, 2.169331f, 2.169331f, 2.169331f});
+  }
+  {
+    std::unique_ptr<xgboost::ObjFunction> obj{xgboost::ObjFunction::Create("rank:ndcg", ctx)};
+    obj->Configure(Args{{"lambdarank_pair_method", "topk"}});
+    float weight_norm = 0.5;  // n_groups / sum_weights
+    std::vector<float> out_grad{2.06611f, -2.06611f, 2.06611f, -2.06611f};
+    std::vector<float> out_hess{2.169331f, 2.169331f, 2.169331f, 2.169331f};
+    auto norm = [=](auto v) { return v * weight_norm; };
+    std::transform(out_grad.begin(), out_grad.end(), out_grad.begin(), norm);
+    std::transform(out_hess.begin(), out_hess.end(), out_hess.begin(), norm);
+    CheckRankingObjFunction(obj, {0, 0.1f, 0, 0.1f}, {0, 1, 0, 1}, {2.0f, 2.0f}, {0, 2, 4},
+                            out_grad, out_hess);
   }
 
   std::unique_ptr<xgboost::ObjFunction> obj{xgboost::ObjFunction::Create("rank:ndcg", ctx)};
@@ -106,7 +110,21 @@ void TestNDCGGPair(Context const* ctx) {
     }
   }
 
-  ASSERT_NO_THROW(obj->DefaultEvalMetric());
+  {
+    // Test empty input
+    std::unique_ptr<xgboost::ObjFunction> obj{xgboost::ObjFunction::Create("rank:ndcg", ctx)};
+    obj->Configure(Args{{"lambdarank_pair_method", "topk"}});
+
+    HostDeviceVector<float> predts;
+    MetaInfo info;
+    info.labels = linalg::Tensor<float, 2>{{}, {0, 1}, ctx->Device()};
+    info.group_ptr_ = {0, 0};
+    info.num_row_ = 0;
+    linalg::Matrix<GradientPair> gpairs;
+    obj->GetGradient(predts, info, 0, &gpairs);
+    ASSERT_EQ(gpairs.Size(), 0);
+  }
+  ASSERT_NO_THROW({ [[maybe_unused]] auto _ = obj->DefaultEvalMetric(); });
 }
 
 TEST(LambdaRank, NDCGGPair) {
@@ -119,7 +137,8 @@ void TestUnbiasedNDCG(Context const* ctx) {
   obj->Configure(Args{{"lambdarank_pair_method", "topk"},
                       {"lambdarank_unbiased", "true"},
                       {"lambdarank_bias_norm", "0"}});
-  std::shared_ptr<DMatrix> p_fmat{RandomDataGenerator{10, 1, 0.0f}.GenerateDMatrix(true, false, 2)};
+  std::shared_ptr<DMatrix> p_fmat{
+      RandomDataGenerator{10, 1, 0.0f}.Classes(2).GenerateDMatrix(true)};
   auto h_label = p_fmat->Info().labels.HostView().Values();
   // Move clicked samples to the beginning.
   std::sort(h_label.begin(), h_label.end(), std::greater<>{});
@@ -245,9 +264,9 @@ void TestMAPStat(Context const* ctx) {
 
     predt.SetDevice(ctx->Device());
     auto rank_idx =
-        p_cache->SortedIdx(ctx, ctx->IsCPU() ? predt.ConstHostSpan() : predt.ConstDeviceSpan());
+        p_cache->SortedIdx(ctx, !ctx->IsCUDA() ? predt.ConstHostSpan() : predt.ConstDeviceSpan());
 
-    if (ctx->IsCPU()) {
+    if (!ctx->IsCUDA()) {
       obj::cpu_impl::MAPStat(ctx, info.labels.HostView().Slice(linalg::All(), 0), rank_idx,
                              p_cache);
     } else {
@@ -282,9 +301,9 @@ void TestMAPStat(Context const* ctx) {
 
     predt.SetDevice(ctx->Device());
     auto rank_idx =
-        p_cache->SortedIdx(ctx, ctx->IsCPU() ? predt.ConstHostSpan() : predt.ConstDeviceSpan());
+        p_cache->SortedIdx(ctx, !ctx->IsCUDA() ? predt.ConstHostSpan() : predt.ConstDeviceSpan());
 
-    if (ctx->IsCPU()) {
+    if (!ctx->IsCUDA()) {
       obj::cpu_impl::MAPStat(ctx, info.labels.HostView().Slice(linalg::All(), 0), rank_idx,
                              p_cache);
     } else {
@@ -305,8 +324,7 @@ TEST(LambdaRank, MAPStat) {
 
 void TestMAPGPair(Context const* ctx) {
   std::unique_ptr<xgboost::ObjFunction> obj{xgboost::ObjFunction::Create("rank:map", ctx)};
-  Args args;
-  obj->Configure(args);
+  obj->Configure({});
 
   CheckConfigReload(obj, "rank:map");
 
@@ -317,14 +335,20 @@ void TestMAPGPair(Context const* ctx) {
                           {0, 2, 4},                                           // group
                           {1.2054923f, -1.2054923f, 1.2054923f, -1.2054923f},  // out grad
                           {1.2657166f, 1.2657166f, 1.2657166f, 1.2657166f});
+
+  obj.reset(xgboost::ObjFunction::Create("rank:map", ctx));
+  obj->Configure({});
+
   // disable the second query group with 0 weight
-  CheckRankingObjFunction(obj,                                  // obj
-                          {0, 0.1f, 0, 0.1f},                   // score
-                          {0, 1, 0, 1},                         // label
-                          {2.0f, 0.0f},                         // weight
-                          {0, 2, 4},                            // group
-                          {1.2054923f, -1.2054923f, .0f, .0f},  // out grad
-                          {1.2657166f, 1.2657166f, .0f, .0f});
+  auto w = 2.0f;  // weight for the first group
+  // weight norm is 1.0 (n_groups / sum_weights)
+  CheckRankingObjFunction(obj,                                          // obj
+                          {0, 0.1f, 0, 0.1f},                           // score
+                          {0, 1, 0, 1},                                 // label
+                          {w, 0.0f},                                    // weight
+                          {0, 2, 4},                                    // group
+                          {1.2054923f * w, -1.2054923f * w, .0f, .0f},  // out grad
+                          {1.2657166f * w, 1.2657166f * w, .0f, .0f});
 }
 
 TEST(LambdaRank, MAPGPair) {

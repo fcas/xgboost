@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014 by Contributors
+ Copyright (c) 2014-2026 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -15,7 +15,6 @@
  */
 package ml.dmlc.xgboost4j.java.example;
 
-import java.util.Arrays;
 import java.util.HashMap;
 
 import ml.dmlc.xgboost4j.java.Booster;
@@ -51,16 +50,16 @@ public class PredictLeafIndices {
     int round = 3;
     Booster booster = XGBoost.train(trainMat, params, round, watches, null, null);
 
-    //predict using first 2 tree
+    // predict using the first 2 boosting iterations
     float[][] leafindex = booster.predictLeaf(testMat, 2);
-    for (float[] leafs : leafindex) {
-      System.out.println(Arrays.toString(leafs));
+    if (leafindex.length > 0 && leafindex[0].length > 1) {
+      System.out.println(leafindex[0][0] + ", " + leafindex[0][1]);
     }
 
-    //predict all trees
+    // predict all boosting iterations
     leafindex = booster.predictLeaf(testMat, 0);
-    for (float[] leafs : leafindex) {
-      System.out.println(Arrays.toString(leafs));
+    if (leafindex.length > 0 && leafindex[0].length > 1) {
+      System.out.println(leafindex[0][0] + ", " + leafindex[0][1]);
     }
   }
 }

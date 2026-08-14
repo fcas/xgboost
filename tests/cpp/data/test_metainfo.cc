@@ -1,17 +1,18 @@
 /**
- * Copyright 2016-2024, XGBoost contributors
+ * Copyright 2016-2025, XGBoost contributors
  */
 #include "test_metainfo.h"
 
-#include <gmock/gmock.h>
 #include <dmlc/io.h>
+#include <gmock/gmock.h>
 #include <xgboost/data.h>
 
 #include <memory>
 #include <string>
 
-#include "../filesystem.h"  // dmlc::TemporaryDirectory
-#include "../helpers.h"     // for GMockTHrow
+#include "../collective/test_worker.h"  // for TestDistributedGlobal
+#include "../filesystem.h"              // TemporaryDirectory
+#include "../helpers.h"                 // for GMockTHrow
 #include "xgboost/base.h"
 
 namespace xgboost {
@@ -59,16 +60,13 @@ TEST(MetaInfo, GetSetFeature) {
 
   size_t constexpr kCols = 19;
   std::vector<std::string> types(kCols, u8"float");
-  std::vector<char const*> c_types(kCols);
+  std::vector<char const *> c_types(kCols);
   std::transform(types.cbegin(), types.cend(), c_types.begin(),
                  [](auto const &str) { return str.c_str(); });
   info.num_col_ = 1;
-  EXPECT_THROW(
-      info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()),
-      dmlc::Error);
+  EXPECT_THROW(info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()), dmlc::Error);
   info.num_col_ = kCols;
-  EXPECT_NO_THROW(
-      info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()));
+  EXPECT_NO_THROW(info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()));
 
   // Test clear.
   info.SetFeatureInfo("feature_type", nullptr, 0);
@@ -77,61 +75,16 @@ TEST(MetaInfo, GetSetFeature) {
   // Other conditions are tested in `SaveLoadBinary`.
 }
 
-namespace {
-void VerifyGetSetFeatureColumnSplit() {
-  xgboost::MetaInfo info;
-  info.data_split_mode = DataSplitMode::kCol;
-  auto const world_size = collective::GetWorldSize();
-
-  auto constexpr kCols{2};
-  std::vector<std::string> types{u8"float", u8"c"};
-  std::vector<char const *> c_types(kCols);
-  std::transform(types.cbegin(), types.cend(), c_types.begin(),
-                 [](auto const &str) { return str.c_str(); });
-  info.num_col_ = kCols;
-  ASSERT_THAT([&] { info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()); },
-              GMockThrow("Length of feature_type must be equal to number of columns"));
-  info.num_col_ = kCols * world_size;
-  EXPECT_NO_THROW(info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size()));
-  std::vector<std::string> expected_type_names{u8"float", u8"c",     u8"float",
-                                               u8"c",     u8"float", u8"c"};
-  EXPECT_EQ(info.feature_type_names, expected_type_names);
-  std::vector<xgboost::FeatureType> expected_types{
-      xgboost::FeatureType::kNumerical, xgboost::FeatureType::kCategorical,
-      xgboost::FeatureType::kNumerical, xgboost::FeatureType::kCategorical,
-      xgboost::FeatureType::kNumerical, xgboost::FeatureType::kCategorical};
-  EXPECT_EQ(info.feature_types.HostVector(), expected_types);
-
-  std::vector<std::string> names{u8"feature0", u8"feature1"};
-  std::vector<char const *> c_names(kCols);
-  std::transform(names.cbegin(), names.cend(), c_names.begin(),
-                 [](auto const &str) { return str.c_str(); });
-  info.num_col_ = kCols;
-  ASSERT_THAT([&] { info.SetFeatureInfo(u8"feature_name", c_names.data(), c_names.size()); },
-              GMockThrow("Length of feature_name must be equal to number of columns"));
-  info.num_col_ = kCols * world_size;
-  EXPECT_NO_THROW(info.SetFeatureInfo(u8"feature_name", c_names.data(), c_names.size()));
-  std::vector<std::string> expected_names{u8"0.feature0", u8"0.feature1", u8"1.feature0",
-                                          u8"1.feature1", u8"2.feature0", u8"2.feature1"};
-  EXPECT_EQ(info.feature_names, expected_names);
-}
-}  // anonymous namespace
-
-TEST(MetaInfo, GetSetFeatureColumnSplit) {
-  auto constexpr kWorldSize{3};
-  RunWithInMemoryCommunicator(kWorldSize, VerifyGetSetFeatureColumnSplit);
-}
-
 TEST(MetaInfo, SaveLoadBinary) {
   xgboost::MetaInfo info;
   xgboost::Context ctx;
 
-  uint64_t constexpr kRows { 64 }, kCols { 32 };
+  uint64_t constexpr kRows{64}, kCols{32};
   auto generator = []() {
-                     static float f = 0;
-                     return f++;
-                   };
-  std::vector<float> values (kRows);
+    static float f = 0;
+    return f++;
+  };
+  std::vector<float> values(kRows);
   std::generate(values.begin(), values.end(), generator);
   info.SetInfo(ctx, "label", Make1dInterfaceTest(values.data(), kRows));
   info.SetInfo(ctx, "weight", Make1dInterfaceTest(values.data(), kRows));
@@ -142,30 +95,26 @@ TEST(MetaInfo, SaveLoadBinary) {
 
   auto featname = u8"特征名";
   std::vector<std::string> types(kCols, u8"float");
-  std::vector<char const*> c_types(kCols);
+  std::vector<char const *> c_types(kCols);
   std::transform(types.cbegin(), types.cend(), c_types.begin(),
                  [](auto const &str) { return str.c_str(); });
   info.SetFeatureInfo(u8"feature_type", c_types.data(), c_types.size());
   std::vector<std::string> names(kCols, featname);
-  std::vector<char const*> c_names(kCols);
+  std::vector<char const *> c_names(kCols);
   std::transform(names.cbegin(), names.cend(), c_names.begin(),
                  [](auto const &str) { return str.c_str(); });
-  info.SetFeatureInfo(u8"feature_name", c_names.data(), c_names.size());;
+  info.SetFeatureInfo(u8"feature_name", c_names.data(), c_names.size());
 
-  dmlc::TemporaryDirectory tempdir;
-  const std::string tmp_file = tempdir.path + "/metainfo.binary";
+  common::TemporaryDirectory tempdir;
+  const std::string tmp_file = tempdir.Str() + "/metainfo.binary";
   {
-    std::unique_ptr<dmlc::Stream> fs {
-      dmlc::Stream::Create(tmp_file.c_str(), "w")
-    };
+    std::unique_ptr<dmlc::Stream> fs{dmlc::Stream::Create(tmp_file.c_str(), "w")};
     info.SaveBinary(fs.get());
   }
 
   {
     // Round-trip test
-    std::unique_ptr<dmlc::Stream> fs {
-      dmlc::Stream::Create(tmp_file.c_str(), "r")
-    };
+    std::unique_ptr<dmlc::Stream> fs{dmlc::Stream::Create(tmp_file.c_str(), "r")};
     xgboost::MetaInfo inforead;
     inforead.LoadBinary(fs.get());
     ASSERT_EQ(inforead.num_row_, kRows);
@@ -189,22 +138,18 @@ TEST(MetaInfo, SaveLoadBinary) {
                             inforead.feature_type_names.cend(),
                             [](auto const &str) { return str == u8"float"; }));
     auto h_ft = inforead.feature_types.HostSpan();
-    EXPECT_TRUE(std::all_of(h_ft.cbegin(), h_ft.cend(), [](auto f) {
-      return f == xgboost::FeatureType::kNumerical;
-    }));
+    EXPECT_TRUE(std::all_of(h_ft.cbegin(), h_ft.cend(),
+                            [](auto f) { return f == xgboost::FeatureType::kNumerical; }));
 
     EXPECT_EQ(inforead.feature_names.size(), kCols);
-    EXPECT_TRUE(std::all_of(inforead.feature_names.cbegin(),
-                            inforead.feature_names.cend(),
-                            [=](auto const& str) {
-                              return str == featname;
-                            }));
+    EXPECT_TRUE(std::all_of(inforead.feature_names.cbegin(), inforead.feature_names.cend(),
+                            [=](auto const &str) { return str == featname; }));
   }
 }
 
 TEST(MetaInfo, LoadQid) {
-  dmlc::TemporaryDirectory tempdir;
-  std::string tmp_file = tempdir.path + "/qid_test.libsvm";
+  common::TemporaryDirectory tempdir;
+  std::string tmp_file = tempdir.Str() + "/qid_test.libsvm";
   {
     std::unique_ptr<dmlc::Stream> fs(dmlc::Stream::Create(tmp_file.c_str(), "w"));
     dmlc::ostream os(fs.get());
@@ -222,16 +167,14 @@ TEST(MetaInfo, LoadQid) {
                 1 qid:3 1:0 2:1 3:1 4:0.5 5:0)qid";
     os.set_stream(nullptr);
   }
-  std::unique_ptr<xgboost::DMatrix> dmat(
-      xgboost::DMatrix::Load(tmp_file + "?format=libsvm", true, xgboost::DataSplitMode::kRow));
+  std::unique_ptr<xgboost::DMatrix> dmat(xgboost::DMatrix::Load(tmp_file + "?format=libsvm", true));
 
-  const xgboost::MetaInfo& info = dmat->Info();
+  const xgboost::MetaInfo &info = dmat->Info();
   const std::vector<xgboost::bst_uint> expected_group_ptr{0, 4, 8, 12};
   CHECK(info.group_ptr_ == expected_group_ptr);
 
-  const std::vector<xgboost::bst_idx_t> expected_offset{
-    0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60
-  };
+  const std::vector<xgboost::bst_idx_t> expected_offset{0,  5,  10, 15, 20, 25, 30,
+                                                        35, 40, 45, 50, 55, 60};
   const std::vector<xgboost::Entry> expected_data{
       xgboost::Entry(1, 1),   xgboost::Entry(2, 1),   xgboost::Entry(3, 0),
       xgboost::Entry(4, 0.2), xgboost::Entry(5, 0),   xgboost::Entry(1, 0),
@@ -284,7 +227,7 @@ TEST(MetaInfo, Validate) {
   info.num_row_ = 10;
   info.num_nonzero_ = 12;
   info.num_col_ = 3;
-  std::vector<xgboost::bst_group_t> groups (11);
+  std::vector<xgboost::bst_group_t> groups(11);
   Context ctx;
   info.SetInfo(ctx, "group", Make1dInterfaceTest(groups.data(), groups.size()));
   EXPECT_THROW(info.Validate(FstCU()), dmlc::Error);
@@ -354,4 +297,70 @@ TEST(MetaInfo, HostExtend) {
 }
 
 TEST(MetaInfo, CPUStridedData) { TestMetaInfoStridedData(DeviceOrd::CPU()); }
+
+namespace {
+class TestMetaInfo : public ::testing::TestWithParam<std::tuple<bst_target_t, bool>> {
+ public:
+  void Run(Context const *ctx, bst_target_t n_targets) {
+    MetaInfo info;
+    info.num_row_ = 128;
+    info.num_col_ = 3;
+    info.feature_names.resize(info.num_col_, "a");
+    info.labels.Reshape(info.num_row_, n_targets);
+
+    HostDeviceVector<bst_idx_t> ridx(info.num_row_ / 2, 0);
+    ridx.SetDevice(ctx->Device());
+    auto h_ridx = ridx.HostSpan();
+    for (std::size_t i = 0, j = 0; i < ridx.Size(); i++, j += 2) {
+      h_ridx[i] = j;
+    }
+
+    {
+      info.weights_.Resize(info.num_row_);
+      auto h_w = info.weights_.HostSpan();
+      std::iota(h_w.begin(), h_w.end(), 0);
+    }
+
+    auto out = info.Slice(ctx, ctx->IsCPU() ? h_ridx : ridx.ConstDeviceSpan(), /*nnz=*/256);
+
+    ASSERT_EQ(info.labels.Device(), ctx->Device());
+    auto h_y = info.labels.HostView();
+    auto h_y_out = out.labels.HostView();
+    ASSERT_EQ(h_y_out.Shape(0), ridx.Size());
+    ASSERT_EQ(h_y_out.Shape(1), n_targets);
+
+    auto h_w = info.weights_.ConstHostSpan();
+    auto h_w_out = out.weights_.ConstHostSpan();
+    ASSERT_EQ(h_w_out.size(), ridx.Size());
+
+    for (std::size_t i = 0; i < ridx.Size(); ++i) {
+      for (bst_target_t t = 0; t < n_targets; ++t) {
+        ASSERT_EQ(h_y_out(i, t), h_y(h_ridx[i], t));
+      }
+      ASSERT_EQ(h_w_out[i], h_w[h_ridx[i]]);
+    }
+
+    for (auto v : info.feature_names) {
+      ASSERT_EQ(v, "a");
+    }
+  }
+};
+}  // anonymous namespace
+
+TEST_P(TestMetaInfo, Slice) {
+  Context ctx;
+  auto [n_targets, is_cuda] = this->GetParam();
+  if (is_cuda) {
+    ctx = MakeCUDACtx(0);
+  }
+  this->Run(&ctx, n_targets);
+}
+
+INSTANTIATE_TEST_SUITE_P(Cpu, TestMetaInfo,
+                         ::testing::Values(std::tuple{1u, false}, std::tuple{3u, false}));
+
+#if defined(XGBOOST_USE_CUDA)
+INSTANTIATE_TEST_SUITE_P(Gpu, TestMetaInfo,
+                         ::testing::Values(std::tuple{1u, true}, std::tuple{3u, true}));
+#endif  // defined(XGBOOST_USE_CUDA)
 }  // namespace xgboost

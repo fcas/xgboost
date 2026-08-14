@@ -1,13 +1,14 @@
 /**
- * Copyright 2015-2023, XGBoost Contributors
+ * Copyright 2015-2025, XGBoost Contributors
  * \file custom_metric.cc
  * \brief This is an example to define plugin of xgboost.
  *  This plugin defines the additional metric function.
  */
 #include <xgboost/base.h>
-#include <xgboost/parameter.h>
-#include <xgboost/objective.h>
 #include <xgboost/json.h>
+#include <xgboost/linalg.h>  // for Vector
+#include <xgboost/objective.h>
+#include <xgboost/parameter.h>
 
 namespace xgboost::obj {
 // This is a helpful data structure to define parameters
@@ -18,7 +19,9 @@ struct MyLogisticParam : public XGBoostParameter<MyLogisticParam> {
   float scale_neg_weight;
   // declare parameters
   DMLC_DECLARE_PARAMETER(MyLogisticParam) {
-    DMLC_DECLARE_FIELD(scale_neg_weight).set_default(1.0f).set_lower_bound(0.0f)
+    DMLC_DECLARE_FIELD(scale_neg_weight)
+        .set_default(1.0f)
+        .set_lower_bound(0.0f)
         .describe("Scale the weight of negative examples by this factor");
   }
 };
@@ -29,7 +32,9 @@ DMLC_REGISTER_PARAMETER(MyLogisticParam);
 // Implement the interface.
 class MyLogistic : public ObjFunction {
  public:
-  void Configure(const Args& args) override { param_.UpdateAllowUnknown(args); }
+  std::set<std::string> Configure(const Args& args) override {
+    return UpdateAndGetUsedParameters(&param_, args);
+  }
 
   [[nodiscard]] ObjInfo Task() const override { return ObjInfo::kRegression; }
 
@@ -52,30 +57,29 @@ class MyLogistic : public ObjFunction {
       out_gpair_h(i) = GradientPair(grad, hess);
     }
   }
-  [[nodiscard]] const char* DefaultEvalMetric() const override {
-    return "logloss";
-  }
-  void PredTransform(HostDeviceVector<float> *io_preds) const override {
+  [[nodiscard]] const char* DefaultEvalMetric() const override { return "logloss"; }
+  void PredTransform(HostDeviceVector<float>* io_preds) const override {
     // transform margin value to probability.
-    std::vector<float> &preds = io_preds->HostVector();
+    std::vector<float>& preds = io_preds->HostVector();
     for (auto& pred : preds) {
       pred = 1.0f / (1.0f + std::exp(-pred));
     }
   }
-  [[nodiscard]] float ProbToMargin(float base_score) const override {
+  void ProbToMargin(linalg::Vector<float>* base_score) const override {
     // transform probability to margin value
-    return -std::log(1.0f / base_score - 1.0f);
+    auto h_intercept = base_score->HostView();
+    for (std::size_t i = 0, n = h_intercept.Size(); i < n; ++i) {
+      h_intercept(i) = -std::log(1.0f / h_intercept(i) - 1.0f);
+    }
   }
 
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
-    out["name"] = String("my_logistic");
+    out["name"] = String("mylogistic");
     out["my_logistic_param"] = ToJson(param_);
   }
 
-  void LoadConfig(Json const& in) override {
-    FromJson(in["my_logistic_param"], &param_);
-  }
+  void LoadConfig(Json const& in) override { FromJson(in["my_logistic_param"], &param_); }
 
  private:
   MyLogisticParam param_;
@@ -84,7 +88,7 @@ class MyLogistic : public ObjFunction {
 // Finally register the objective function.
 // After it succeeds you can try use xgboost with objective=mylogistic
 XGBOOST_REGISTER_OBJECTIVE(MyLogistic, "mylogistic")
-.describe("User defined logistic regression plugin")
-.set_body([]() { return new MyLogistic(); });
+    .describe("User defined logistic regression plugin")
+    .set_body([]() { return new MyLogistic(); });
 
 }  // namespace xgboost::obj

@@ -1,5 +1,5 @@
 /**
- * Copyright 2023, XGBoost contributors
+ * Copyright 2023-2025, XGBoost contributors
  */
 #include <xgboost/context.h>      // for Context
 #include <xgboost/learner.h>      // for Learner
@@ -8,7 +8,6 @@
 #include <limits>  // for numeric_limits
 #include <memory>  // for shared_ptr
 #include <string>  // for string
-#include <thread>  // for thread
 
 #include "../../../src/data/adapter.h"           // for ArrayAdapter
 #include "../../../src/data/device_adapter.cuh"  // for CupyAdapter
@@ -42,7 +41,7 @@ void TestInplaceFallback(Context const* ctx) {
 
   // learner is configured to the device specified by ctx
   std::unique_ptr<Learner> learner{Learner::Create({Xy})};
-  learner->SetParam("device", ctx->DeviceName());
+  learner->Configure({{"device", ctx->DeviceName()}});
   for (std::int32_t i = 0; i < 3; ++i) {
     learner->UpdateOneIter(i, Xy);
   }
@@ -50,9 +49,9 @@ void TestInplaceFallback(Context const* ctx) {
   std::shared_ptr<DMatrix> p_m{new data::DMatrixProxy};
   auto proxy = std::dynamic_pointer_cast<data::DMatrixProxy>(p_m);
   if (data_ordinal.IsCPU()) {
-    proxy->SetArrayData(StringView{X});
+    proxy->SetArray(StringView{X});
   } else {
-    proxy->SetCUDAArray(X.c_str());
+    proxy->SetCudaArray(X.c_str());
   }
 
   HostDeviceVector<float>* out_predt{nullptr};
@@ -66,7 +65,7 @@ void TestInplaceFallback(Context const* ctx) {
   Context new_ctx = *proxy->Ctx();
   ASSERT_NE(new_ctx.Ordinal(), ctx->Ordinal());
 
-  learner->SetParam("device", new_ctx.DeviceName());
+  learner->Configure({{"device", new_ctx.DeviceName()}});
   HostDeviceVector<float>* out_predt_1{nullptr};
   // no warning is raised
   ::testing::internal::CaptureStderr();

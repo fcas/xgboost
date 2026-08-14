@@ -6,7 +6,7 @@ import xgboost as xgb
 
 
 # Test for integer overflow or out of memory exceptions
-def test_large_input():
+def test_large_input() -> None:
     available_bytes, _ = cp.cuda.runtime.memGetInfo()
     # 15 GB
     required_bytes = 1.5e10
@@ -19,6 +19,8 @@ def test_large_input():
     y = cp.ones(m)
     w = cp.ones(m)
     dmat = xgb.QuantileDMatrix(X, y, weight=w)
-    booster = xgb.train({"tree_method": "gpu_hist", "max_depth": 1}, dmat, 1)
+    booster = xgb.train(
+        {"tree_method": "hist", "max_depth": 1, "device": "cuda"}, dmat, 1
+    )
     del y
     booster.inplace_predict(X)

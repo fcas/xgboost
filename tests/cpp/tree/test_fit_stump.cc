@@ -1,16 +1,17 @@
 /**
- * Copyright 2022-2023, XGBoost Contributors
+ * Copyright 2022-2024, XGBoost Contributors
  */
 #include <gtest/gtest.h>
 #include <xgboost/linalg.h>
 
 #include "../../src/common/linalg_op.h"
 #include "../../src/tree/fit_stump.h"
+#include "../collective/test_worker.h"  // for TestDistributedGlobal
 #include "../helpers.h"
 
 namespace xgboost::tree {
 namespace {
-void TestFitStump(Context const *ctx, DataSplitMode split = DataSplitMode::kRow) {
+void TestFitStump(Context const *ctx) {
   std::size_t constexpr kRows = 16, kTargets = 2;
   linalg::Matrix<GradientPair> gpair;
   gpair.SetDevice(ctx->Device());
@@ -22,9 +23,7 @@ void TestFitStump(Context const *ctx, DataSplitMode split = DataSplitMode::kRow)
     }
   }
   linalg::Vector<float> out;
-  MetaInfo info;
-  info.data_split_mode = split;
-  FitStump(ctx, info, gpair, kTargets, &out);
+  FitStump(ctx, gpair, kTargets, &out);
   auto h_out = out.HostView();
   for (auto it = linalg::cbegin(h_out); it != linalg::cend(h_out); ++it) {
     // sum_hess == kRows
@@ -43,14 +42,9 @@ TEST(InitEstimation, FitStump) {
 #if defined(XGBOOST_USE_CUDA)
 TEST(InitEstimation, GPUFitStump) {
   Context ctx;
-  ctx.UpdateAllowUnknown(Args{{"gpu_id", "0"}});
+  ctx.UpdateAllowUnknown(Args{{"device", "cuda"}});
   TestFitStump(&ctx);
 }
 #endif  // defined(XGBOOST_USE_CUDA)
 
-TEST(InitEstimation, FitStumpColumnSplit) {
-  Context ctx;
-  auto constexpr kWorldSize{3};
-  RunWithInMemoryCommunicator(kWorldSize, &TestFitStump, &ctx, DataSplitMode::kCol);
-}
 }  // namespace xgboost::tree

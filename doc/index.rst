@@ -20,7 +20,6 @@ Contents
   get_started
   tutorials/index
   faq
-  XGBoost User Forum <https://discuss.xgboost.ai>
   GPU Support <gpu/index>
   parameter
   prediction
@@ -33,5 +32,6 @@ Contents
   Julia Package <julia>
   C Package <c>
   C++ Interface <c++>
-  CLI Interface <cli>
+  security
   contrib/index
+  changes/index

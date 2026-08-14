@@ -1,5 +1,5 @@
 /**
- * Copyright 2023, XGBoost Contributors
+ * Copyright 2023-2025, XGBoost Contributors
  */
 #include <gtest/gtest.h>
 #include <xgboost/global_config.h>  // for GlobalConfigThreadLocalStore
@@ -20,7 +20,7 @@ TEST(GBlinear, DispatchUpdater) {
   auto test = [](std::string device) {
     auto p_fmat = RandomDataGenerator{10, 10, 0.0f}.GenerateDMatrix(true);
     std::unique_ptr<Learner> learner{Learner::Create({p_fmat})};
-    learner->SetParams(
+    learner->Configure(
         Args{{"booster", "gblinear"}, {"updater", "coord_descent"}, {"device", device}});
     learner->Configure();
     for (std::int32_t iter = 0; iter < 3; ++iter) {

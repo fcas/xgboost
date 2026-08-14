@@ -1,11 +1,7 @@
 /**
- * Copyright (c) 2022-2024, XGBoost Contributors
+ * Copyright 2022-2025, XGBoost Contributors
  */
 #pragma once
-
-#if !defined(NOMINMAX) && defined(_WIN32)
-#define NOMINMAX
-#endif                   // !defined(NOMINMAX)
 
 #include <cerrno>        // errno, EINTR, EBADF
 #include <climits>       // HOST_NAME_MAX
@@ -16,16 +12,14 @@
 #include <system_error>  // std::error_code, std::system_category
 #include <utility>       // std::swap
 
-#if !defined(xgboost_IS_MINGW)
-
-#if defined(__MINGW32__)
-#define xgboost_IS_MINGW 1
-#endif  // defined(__MINGW32__)
-
-#endif  // xgboost_IS_MINGW
+#if defined(__linux__)
+#include <sys/ioctl.h>  // for TIOCOUTQ, FIONREAD
+#endif                  // defined(__linux__)
 
 #if defined(_WIN32)
-
+// Guard the include.
+#include <xgboost/windefs.h>
+// Socket API
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
@@ -37,9 +31,9 @@ using in_port_t = std::uint16_t;
 
 #if !defined(xgboost_IS_MINGW)
 using ssize_t = int;
-#endif                    // !xgboost_IS_MINGW()
+#endif  // !xgboost_IS_MINGW()
 
-#else                     // UNIX
+#else  // UNIX
 
 #include <arpa/inet.h>    // inet_ntop
 #include <fcntl.h>        // fcntl, F_GETFL, O_NONBLOCK
@@ -105,6 +99,7 @@ inline auto ThrowAtError(StringView fn_name, std::int32_t errsv = LastError()) {
 using SocketT = SOCKET;
 #else
 using SocketT = int;
+#define INVALID_SOCKET -1
 #endif  // defined(_WIN32)
 
 #if !defined(xgboost_CHECK_SYS_CALL)
@@ -282,7 +277,7 @@ class TCPSocket {
   SockDomain domain_{SockDomain::kV4};
 #endif
 
-  constexpr static HandleT InvalidSocket() { return -1; }
+  constexpr static HandleT InvalidSocket() { return INVALID_SOCKET; }
 
   explicit TCPSocket(HandleT newfd) : handle_{newfd} {}
 
@@ -306,7 +301,7 @@ class TCPSocket {
     };
 
 #if defined(_WIN32)
-    WSAPROTOCOL_INFOA info;
+    WSAPROTOCOL_INFOW info;
     socklen_t len = sizeof(info);
     xgboost_CHECK_SYS_CALL(
         getsockopt(handle_, SOL_SOCKET, SO_PROTOCOL_INFO, reinterpret_cast<char *>(&info), &len),
@@ -319,7 +314,8 @@ class TCPSocket {
     std::int32_t domain;
     socklen_t len = sizeof(domain);
     xgboost_CHECK_SYS_CALL(
-        getsockopt(handle_, SOL_SOCKET, SO_DOMAIN, reinterpret_cast<char *>(&domain), &len), 0);
+        getsockopt(this->Handle(), SOL_SOCKET, SO_DOMAIN, reinterpret_cast<char *>(&domain), &len),
+        0);
     return ret_iafamily(domain);
 #else
     struct sockaddr sa;
@@ -426,6 +422,35 @@ class TCPSocket {
     return Success();
   }
 
+  [[nodiscard]] Result SendBufSize(std::int32_t *n_bytes) {
+    socklen_t optlen;
+    auto rc = getsockopt(this->Handle(), SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char *>(n_bytes),
+                         &optlen);
+    if (rc != 0 || optlen != sizeof(std::int32_t)) {
+      return system::FailWithCode("getsockopt");
+    }
+    return Success();
+  }
+  [[nodiscard]] Result RecvBufSize(std::int32_t *n_bytes) {
+    socklen_t optlen;
+    auto rc = getsockopt(this->Handle(), SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char *>(n_bytes),
+                         &optlen);
+    if (rc != 0 || optlen != sizeof(std::int32_t)) {
+      return system::FailWithCode("getsockopt");
+    }
+    return Success();
+  }
+#if defined(__linux__)
+  [[nodiscard]] Result PendingSendSize(std::int32_t *n_bytes) const {
+    return ioctl(this->Handle(), TIOCOUTQ, n_bytes) == 0 ? Success()
+                                                         : system::FailWithCode("ioctl");
+  }
+  [[nodiscard]] Result PendingRecvSize(std::int32_t *n_bytes) const {
+    return ioctl(this->Handle(), FIONREAD, n_bytes) == 0 ? Success()
+                                                         : system::FailWithCode("ioctl");
+  }
+#endif  // defined(__linux__)
+
   [[nodiscard]] Result SetKeepAlive() {
     std::int32_t keepalive = 1;
     auto rc = setsockopt(handle_, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<char *>(&keepalive),
@@ -436,10 +461,9 @@ class TCPSocket {
     return Success();
   }
 
-  [[nodiscard]] Result SetNoDelay() {
-    std::int32_t tcp_no_delay = 1;
-    auto rc = setsockopt(handle_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&tcp_no_delay),
-                         sizeof(tcp_no_delay));
+  [[nodiscard]] Result SetNoDelay(std::int32_t no_delay = 1) {
+    auto rc = setsockopt(handle_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&no_delay),
+                         sizeof(no_delay));
     if (rc != 0) {
       return system::FailWithCode("Failed to set TCP no delay.");
     }
@@ -515,13 +539,10 @@ class TCPSocket {
   [[nodiscard]] HandleT const &Handle() const { return handle_; }
   /**
    * @brief Listen to incoming requests. Should be called after bind.
+   *
+   *   Both the default and minimum backlog is set to 256.
    */
-  [[nodiscard]] Result Listen(std::int32_t backlog = 16) {
-    if (listen(handle_, backlog) != 0) {
-      return system::FailWithCode("Failed to listen.");
-    }
-    return Success();
-  }
+  [[nodiscard]] Result Listen(std::int32_t backlog = 256);
   /**
    * @brief Bind socket to INADDR_ANY, return the port selected by the OS.
    */
@@ -578,10 +599,15 @@ class TCPSocket {
       return std::make_pair(Success(), std::int32_t{ntohs(res_addr.sin6_port)});
     }
   }
-
+  /**
+   * @brief Bind the socket to the address.
+   *
+   * @param ip[in]        The IP address.
+   * @param port [in,out] Let the system choose a port if this parameter is set to 0.
+   */
   [[nodiscard]] Result Bind(StringView ip, std::int32_t *port) {
     // bind socket handle_ to ip
-    auto addr = MakeSockAddress(ip, 0);
+    auto addr = MakeSockAddress(ip, *port);
     std::int32_t errc{0};
     if (addr.IsV4()) {
       auto handle = reinterpret_cast<sockaddr const *>(&addr.V4().Handle());
@@ -597,50 +623,58 @@ class TCPSocket {
     if (!rc.OK()) {
       return std::move(rc);
     }
-    *port = new_port;
+    if (*port == 0) {
+      *port = new_port;
+      return Success();
+    }
+    if (*port != new_port) {
+      return Fail("Got an invalid port from bind.");
+    }
     return Success();
   }
 
   /**
-   * \brief Send data, without error then all data should be sent.
+   * @brief Send data, without error then all data should be sent.
    */
-  [[nodiscard]] auto SendAll(void const *buf, std::size_t len) {
+  [[nodiscard]] Result SendAll(void const *buf, std::size_t len, std::size_t *n_sent) {
     char const *_buf = reinterpret_cast<const char *>(buf);
-    std::size_t ndone = 0;
+    std::size_t &ndone = *n_sent;
+    ndone = 0;
     while (ndone < len) {
       ssize_t ret = send(handle_, _buf, len - ndone, 0);
       if (ret == -1) {
         if (system::LastErrorWouldBlock()) {
-          return ndone;
+          return Success();
         }
-        system::ThrowAtError("send");
+        return system::FailWithCode("send");
       }
       _buf += ret;
       ndone += ret;
     }
-    return ndone;
+    return Success();
   }
   /**
-   * \brief Receive data, without error then all data should be received.
+   * @brief Receive data, without error then all data should be received.
    */
-  [[nodiscard]] auto RecvAll(void *buf, std::size_t len) {
+  [[nodiscard]] Result RecvAll(void *buf, std::size_t len, std::size_t *n_recv) {
     char *_buf = reinterpret_cast<char *>(buf);
-    std::size_t ndone = 0;
+    std::size_t &ndone = *n_recv;
+    ndone = 0;
     while (ndone < len) {
       ssize_t ret = recv(handle_, _buf, len - ndone, MSG_WAITALL);
       if (ret == -1) {
         if (system::LastErrorWouldBlock()) {
-          return ndone;
+          return Success();
         }
-        system::ThrowAtError("recv");
+        return system::FailWithCode("recv");
       }
       if (ret == 0) {
-        return ndone;
+        return Success();
       }
       _buf += ret;
       ndone += ret;
     }
-    return ndone;
+    return Success();
   }
   /**
    * \brief Send data using the socket
@@ -661,8 +695,11 @@ class TCPSocket {
    * \return size of data actually received return -1 if error occurs
    */
   auto Recv(void *buf, std::size_t len, std::int32_t flags = 0) {
-    char *_buf = reinterpret_cast<char *>(buf);
+    char *_buf = static_cast<char *>(buf);
+    // See https://github.com/llvm/llvm-project/issues/104241 for skipped tidy analysis
+    // NOLINTBEGIN(clang-analyzer-unix.BlockInCriticalSection)
     return recv(handle_, _buf, len, flags);
+    // NOLINTEND(clang-analyzer-unix.BlockInCriticalSection)
   }
   /**
    * \brief Send string, format is matched with the Python socket wrapper in RABIT.
@@ -804,7 +841,3 @@ Result INetNToP(H const &host, std::string *p_out) {
 }  // namespace xgboost
 
 #undef xgboost_CHECK_SYS_CALL
-
-#if defined(xgboost_IS_MINGW)
-#undef xgboost_IS_MINGW
-#endif

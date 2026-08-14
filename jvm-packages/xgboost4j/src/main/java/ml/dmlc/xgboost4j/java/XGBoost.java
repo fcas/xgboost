@@ -1,5 +1,5 @@
 /*
- Copyright (c) 2014-2023 by Contributors
+ Copyright (c) 2014-2024 by Contributors
 
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
@@ -386,6 +386,16 @@ public class XGBoost {
   }
 
   // visiable for testing
+
+  /**
+   * Decides whether the evaluation metrics are to be maximized or not.
+   *
+   * @param evalInfo The evaluation log string from which the metric name is inferred.
+   * @param evalNames The names of the evaluation matrices.
+   * @param params The parameters that contain information regarding whether the
+   *  evaluation metrics are to be maximized or not.
+   * @return True if the evaluation metrics are to be maximized, false otherwise.
+   */
   public static boolean isMaximizeEvaluation(String evalInfo,
                                              String[] evalNames,
                                              Map<String, Object> params) {
@@ -553,7 +563,7 @@ public class XGBoost {
         value += tvalue;
       }
       value /= cvMap.get(key).size();
-      aggResult += String.format("\tcv-%s:%f", key, value);
+      aggResult += String.format(Locale.ROOT, "\tcv-%s:%f", key, value);
     }
 
     return aggResult;

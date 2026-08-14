@@ -1,41 +1,39 @@
 /**
- * Copyright 2020-2023 by XGBoost contributors
+ * Copyright 2020-2026, XGBoost contributors
  */
 #include "rank_metric.h"
 
 #include <dmlc/omp.h>
 #include <dmlc/registry.h>
 
-#include <algorithm>                         // for stable_sort, copy, fill_n, min, max
-#include <array>                             // for array
-#include <cmath>                             // for log, sqrt
-#include <functional>                        // for less, greater
-#include <limits>                            // for numeric_limits
-#include <map>                               // for operator!=, _Rb_tree_const_iterator
-#include <memory>                            // for allocator, unique_ptr, shared_ptr, __shared_...
-#include <numeric>                           // for accumulate
-#include <ostream>                           // for operator<<, basic_ostream, ostringstream
-#include <string>                            // for char_traits, operator<, basic_string, to_string
-#include <utility>                           // for pair, make_pair
-#include <vector>                            // for vector
+#include <algorithm>   // for stable_sort, copy, fill_n, min, max
+#include <array>       // for array
+#include <cmath>       // for log, sqrt
+#include <functional>  // for less, greater
+#include <map>         // for operator!=, _Rb_tree_const_iterator
+#include <memory>      // for allocator, unique_ptr, shared_ptr, __shared_...
+#include <numeric>     // for accumulate
+#include <ostream>     // for operator<<, basic_ostream, ostringstream
+#include <string>      // for char_traits, operator<, basic_string, to_string
+#include <utility>     // for pair, make_pair
+#include <vector>      // for vector
 
-#include "../collective/aggregator.h"        // for ApplyWithLabels
-#include "../common/algorithm.h"             // for ArgSort, Sort
-#include "../common/linalg_op.h"             // for cbegin, cend
-#include "../common/math.h"                  // for CmpFirst
-#include "../common/optional_weight.h"       // for OptionalWeights, MakeOptionalWeights
-#include "dmlc/common.h"                     // for OMPException
-#include "metric_common.h"                   // for MetricNoCache, GPUMetric, PackedReduceResult
-#include "xgboost/base.h"                    // for bst_float, bst_omp_uint, bst_group_t, Args
-#include "xgboost/cache.h"                   // for DMatrixCache
-#include "xgboost/context.h"                 // for Context
-#include "xgboost/data.h"                    // for MetaInfo, DMatrix
-#include "xgboost/host_device_vector.h"      // for HostDeviceVector
-#include "xgboost/json.h"                    // for Json, FromJson, IsA, ToJson, get, Null, Object
-#include "xgboost/linalg.h"                  // for Tensor, TensorView, Range, VectorView, MakeT...
-#include "xgboost/logging.h"                 // for CHECK, ConsoleLogger, LOG_INFO, CHECK_EQ
-#include "xgboost/metric.h"                  // for MetricReg, XGBOOST_REGISTER_METRIC, Metric
-#include "xgboost/string_view.h"             // for StringView
+#include "../collective/aggregator.h"
+#include "../collective/communicator-inl.h"
+#include "../common/algorithm.h"         // for ArgSort, Sort
+#include "../common/linalg_op.h"         // for cbegin, cend
+#include "../common/optional_weight.h"   // for OptionalWeights, MakeOptionalWeights
+#include "metric_common.h"               // for MetricNoCache, GPUMetric, PackedReduceResult
+#include "xgboost/base.h"                // for bst_float, bst_omp_uint, bst_group_t, Args
+#include "xgboost/cache.h"               // for DMatrixCache
+#include "xgboost/context.h"             // for Context
+#include "xgboost/data.h"                // for MetaInfo, DMatrix
+#include "xgboost/host_device_vector.h"  // for HostDeviceVector
+#include "xgboost/json.h"                // for Json, FromJson, IsA, ToJson, get, Null, Object
+#include "xgboost/linalg.h"              // for Tensor, TensorView, Range, VectorView, MakeT...
+#include "xgboost/logging.h"             // for CHECK, ConsoleLogger, LOG_INFO, CHECK_EQ
+#include "xgboost/metric.h"              // for MetricReg, XGBOOST_REGISTER_METRIC, Metric
+#include "xgboost/string_view.h"         // for StringView
 
 namespace {
 using PredIndPair = std::pair<xgboost::bst_float, xgboost::ltr::rel_degree_t>;
@@ -59,13 +57,14 @@ struct EvalAMS : public MetricNoCache {
   }
 
   double Eval(const HostDeviceVector<bst_float>& preds, const MetaInfo& info) override {
+    CheckRowWeights(info);
     CHECK(!collective::IsDistributed()) << "metric AMS do not support distributed evaluation";
     using namespace std;  // NOLINT(*)
 
     const auto ndata = static_cast<bst_omp_uint>(info.labels.Size());
     PredIndPairContainer rec(ndata);
 
-    const auto &h_preds = preds.ConstHostVector();
+    const auto& h_preds = preds.ConstHostVector();
     common::ParallelFor(ndata, ctx_->Threads(),
                         [&](bst_omp_uint i) { rec[i] = std::make_pair(h_preds[i], i); });
     common::Sort(ctx_, rec.begin(), rec.end(),
@@ -76,7 +75,7 @@ struct EvalAMS : public MetricNoCache {
     unsigned thresindex = 0;
     double s_tp = 0.0, b_fp = 0.0, tams = 0.0;
     const auto& labels = info.labels.View(DeviceOrd::CPU());
-    for (unsigned i = 0; i < static_cast<unsigned>(ndata-1) && i < ntop; ++i) {
+    for (unsigned i = 0; i < static_cast<unsigned>(ndata - 1) && i < ntop; ++i) {
       const unsigned ridx = rec[i].second;
       const bst_float wt = info.GetWeight(ridx);
       if (labels(ridx) > 0.5f) {
@@ -97,13 +96,11 @@ struct EvalAMS : public MetricNoCache {
       return static_cast<bst_float>(tams);
     } else {
       return static_cast<bst_float>(
-          sqrt(2 * ((s_tp + b_fp + br) * log(1.0 + s_tp/(b_fp + br)) - s_tp)));
+          sqrt(2 * ((s_tp + b_fp + br) * log(1.0 + s_tp / (b_fp + br)) - s_tp)));
     }
   }
 
-  [[nodiscard]] const char* Name() const override {
-    return name_.c_str();
-  }
+  [[nodiscard]] const char* Name() const override { return name_.c_str(); }
 
  private:
   std::string name_;
@@ -114,13 +111,12 @@ struct EvalAMS : public MetricNoCache {
 struct EvalRank : public MetricNoCache, public EvalRankConfig {
  public:
   double Eval(const HostDeviceVector<bst_float>& preds, const MetaInfo& info) override {
-    CHECK_EQ(preds.Size(), info.labels.Size())
-        << "label size predict size not match";
+    CHECK_EQ(preds.Size(), info.labels.Size()) << "label size predict size not match";
 
     // quick consistency when group is not available
     std::vector<unsigned> tgptr(2, 0);
     tgptr[1] = static_cast<unsigned>(preds.Size());
-    const auto &gptr = info.group_ptr_.size() == 0 ? tgptr : info.group_ptr_;
+    const auto& gptr = info.group_ptr_.size() == 0 ? tgptr : info.group_ptr_;
 
     CHECK_NE(gptr.size(), 0U) << "must specify group when constructing rank file";
     CHECK_EQ(gptr.back(), preds.Size())
@@ -128,50 +124,32 @@ struct EvalRank : public MetricNoCache, public EvalRankConfig {
 
     const auto ngroups = static_cast<bst_omp_uint>(gptr.size() - 1);
     // sum statistics
-    double sum_metric = 0.0f;
+    const auto& h_labels = info.labels.HostView();
+    CHECK_LE(h_labels.Shape(1), 1);
+    const auto& h_preds = preds.ConstHostVector();
 
-    CHECK(ctx_);
     std::vector<double> sum_tloc(ctx_->Threads(), 0.0);
-
-    {
-      const auto& labels = info.labels.HostView();
-      const auto &h_preds = preds.ConstHostVector();
-
-      dmlc::OMPException exc;
-#pragma omp parallel num_threads(ctx_->Threads())
-      {
-        exc.Run([&]() {
-          // each thread takes a local rec
-          PredIndPairContainer rec;
-#pragma omp for schedule(static)
-          for (bst_omp_uint k = 0; k < ngroups; ++k) {
-            exc.Run([&]() {
-              rec.clear();
-              for (unsigned j = gptr[k]; j < gptr[k + 1]; ++j) {
-                rec.emplace_back(h_preds[j], static_cast<int>(labels(j)));
-              }
-              sum_tloc[omp_get_thread_num()] += this->EvalGroup(&rec);
-            });
-          }
-        });
+    common::ParallelForBlock(ngroups, ctx_->Threads(), [&](auto&& blk) {
+      for (auto group_idx = blk.begin(); group_idx < blk.end(); ++group_idx) {
+        PredIndPairContainer rec;
+        for (unsigned j = gptr[group_idx]; j < gptr[group_idx + 1]; ++j) {
+          rec.emplace_back(h_preds[j], static_cast<int>(h_labels(j)));
+        }
+        sum_tloc[omp_get_thread_num()] += this->EvalGroup(&rec);
       }
-      sum_metric = std::accumulate(sum_tloc.cbegin(), sum_tloc.cend(), 0.0);
-      exc.Rethrow();
-    }
-
-    return collective::GlobalRatio(ctx_, info, sum_metric, static_cast<double>(ngroups));
+    });
+    double sum_metric = std::accumulate(sum_tloc.cbegin(), sum_tloc.cend(), 0.0);
+    return collective::GlobalRatio(ctx_, sum_metric, static_cast<double>(ngroups));
   }
 
-  [[nodiscard]] const char* Name() const override {
-    return name.c_str();
-  }
+  [[nodiscard]] const char* Name() const override { return name.c_str(); }
 
  protected:
   explicit EvalRank(const char* name, const char* param) {
     this->name = ltr::ParseMetricName(name, param, &topn, &minus);
   }
 
-  virtual double EvalGroup(PredIndPairContainer *recptr) const = 0;
+  virtual double EvalGroup(PredIndPairContainer* recptr) const = 0;
 };
 
 /*! \brief Cox: Partial likelihood of the Cox proportional hazards model */
@@ -183,12 +161,12 @@ struct EvalCox : public MetricNoCache {
     using namespace std;  // NOLINT(*)
 
     const auto ndata = static_cast<bst_omp_uint>(info.labels.Size());
-    const auto &label_order = info.LabelAbsSort(ctx_);
+    const auto& label_order = info.LabelAbsSort(ctx_);
 
     // pre-compute a sum for the denominator
     double exp_p_sum = 0;  // we use double because we might need the precision with large datasets
 
-    const auto &h_preds = preds.ConstHostVector();
+    const auto& h_preds = preds.ConstHostVector();
     for (omp_ulong i = 0; i < ndata; ++i) {
       exp_p_sum += h_preds[i];
     }
@@ -213,21 +191,19 @@ struct EvalCox : public MetricNoCache {
       }
     }
 
-    return out/num_events;  // normalize by the number of events
+    return out / num_events;  // normalize by the number of events
   }
 
-  [[nodiscard]] const char* Name() const override {
-    return "cox-nloglik";
-  }
+  [[nodiscard]] const char* Name() const override { return "cox-nloglik"; }
 };
 
 XGBOOST_REGISTER_METRIC(AMS, "ams")
-.describe("AMS metric for higgs.")
-.set_body([](const char* param) { return new EvalAMS(param); });
+    .describe("AMS metric for higgs.")
+    .set_body([](const char* param) { return new EvalAMS(param); });
 
 XGBOOST_REGISTER_METRIC(Cox, "cox-nloglik")
-.describe("Negative log partial likelihood of Cox proportional hazards model.")
-.set_body([](const char*) { return new EvalCox(); });
+    .describe("Negative log partial likelihood of Cox proportional hazards model.")
+    .set_body([](const char*) { return new EvalCox(); });
 
 // ranking metrics that requires cache
 template <typename Cache>
@@ -250,10 +226,6 @@ class EvalRankWithCache : public Metric {
     }
     param_.UpdateAllowUnknown(Args{});
   }
-  void Configure(Args const&) override {
-    // do not configure, otherwise the ndcg param will be forced into the same as the one in
-    // objective.
-  }
   void LoadConfig(Json const& in) override {
     if (IsA<Null>(in)) {
       return;
@@ -274,16 +246,18 @@ class EvalRankWithCache : public Metric {
   double Evaluate(HostDeviceVector<float> const& preds, std::shared_ptr<DMatrix> p_fmat) override {
     double result{0.0};
     auto const& info = p_fmat->Info();
-    collective::ApplyWithLabels(ctx_, info, &result, sizeof(double), [&] {
-      auto p_cache = cache_.CacheItem(p_fmat, ctx_, info, param_);
-      if (p_cache->Param() != param_) {
-        p_cache = cache_.ResetItem(p_fmat, ctx_, info, param_);
-      }
-      CHECK(p_cache->Param() == param_);
-      CHECK_EQ(preds.Size(), info.labels.Size());
+    if (!info.labels.Empty()) {
+      CHECK_EQ(info.labels.Shape(1), 1) << "Ranking metrics do not support multi-target labels.";
+    }
+    CHECK_EQ(preds.Size(), info.labels.Size());
 
-      result = this->Eval(preds, info, p_cache);
-    });
+    auto p_cache = cache_.CacheItem(p_fmat, ctx_, info, param_);
+    if (p_cache->Param() != param_) {
+      p_cache = cache_.ResetItem(p_fmat, ctx_, info, param_);
+    }
+    CHECK(p_cache->Param() == param_);
+
+    result = this->Eval(preds, info, p_cache);
     return result;
   }
 
@@ -294,9 +268,9 @@ class EvalRankWithCache : public Metric {
 };
 
 namespace {
-double Finalize(Context const* ctx, MetaInfo const& info, double score, double sw) {
+double Finalize(Context const* ctx, MetaInfo const&, double score, double sw) {
   std::array<double, 2> dat{score, sw};
-  auto rc = collective::GlobalSum(ctx, info, linalg::MakeVec(dat.data(), 2));
+  auto rc = collective::GlobalSum(ctx, linalg::MakeVec(dat.data(), 2));
   collective::SafeColl(rc);
   std::tie(score, sw) = std::tuple_cat(dat);
   if (sw > 0.0) {
@@ -329,10 +303,9 @@ class EvalPrecision : public EvalRankWithCache<ltr::PreCache> {
 
     auto gptr = p_cache->DataGroupPtr(ctx_);
     auto h_label = info.labels.HostView().Slice(linalg::All(), 0);
-    auto h_predt = linalg::MakeTensorView(ctx_, &predt, predt.Size());
     auto rank_idx = p_cache->SortedIdx(ctx_, predt.ConstHostSpan());
 
-    auto weight = common::MakeOptionalWeights(ctx_, info.weights_);
+    auto weight = common::MakeOptionalWeights(ctx_->Device(), info.weights_);
     auto pre = p_cache->Pre(ctx_);
 
     common::ParallelFor(p_cache->Groups(), ctx_->Threads(), [&](auto g) {
@@ -366,6 +339,21 @@ class EvalNDCG : public EvalRankWithCache<ltr::NDCGCache> {
  public:
   using EvalRankWithCache::EvalRankWithCache;
 
+  std::set<std::string> Configure(Args const& args) override {
+    // do not configure, otherwise the ndcg param like top-k will be forced into the same
+    // as the one in objective. The metric has its own syntax for parameter.
+    std::set<std::string> used;
+    for (auto const& [key, value] : args) {
+      // Make a special case for the exp gain parameter, which is not exposed in the
+      // metric configuration syntax.
+      if (key == "ndcg_exp_gain") {
+        this->param_.UpdateAllowUnknown(Args{{key, value}});
+        used.insert(key);
+      }
+    }
+    return used;
+  }
+
   double Eval(HostDeviceVector<float> const& preds, MetaInfo const& info,
               std::shared_ptr<ltr::NDCGCache> p_cache) override {
     if (ctx_->IsCUDA()) {
@@ -384,7 +372,7 @@ class EvalNDCG : public EvalRankWithCache<ltr::NDCGCache> {
 
     auto h_label = info.labels.HostView();
     auto h_predt = linalg::MakeTensorView(ctx_, &preds, preds.Size());
-    auto weights = common::MakeOptionalWeights(ctx_, info.weights_);
+    auto weights = common::MakeOptionalWeights(ctx_->Device(), info.weights_);
 
     common::ParallelFor(n_groups, ctx_->Threads(), [&](auto g) {
       auto g_predt = h_predt.Slice(linalg::Range(group_ptr[g], group_ptr[g + 1]));
@@ -433,7 +421,6 @@ class EvalMAPScore : public EvalRankWithCache<ltr::MAPCache> {
 
     auto gptr = p_cache->DataGroupPtr(ctx_);
     auto h_label = info.labels.HostView().Slice(linalg::All(), 0);
-    auto h_predt = linalg::MakeTensorView(ctx_, &predt, predt.Size());
 
     auto map_gloc = p_cache->Map(ctx_);
     std::fill_n(map_gloc.data(), map_gloc.size(), 0.0);
@@ -461,7 +448,7 @@ class EvalMAPScore : public EvalRankWithCache<ltr::MAPCache> {
     });
 
     auto sw = 0.0;
-    auto weight = common::MakeOptionalWeights(ctx_, info.weights_);
+    auto weight = common::MakeOptionalWeights(ctx_->Device(), info.weights_);
     if (!weight.Empty()) {
       CHECK_EQ(weight.weights.size(), p_cache->Groups());
     }
@@ -480,13 +467,9 @@ XGBOOST_REGISTER_METRIC(Precision, "pre")
 
 XGBOOST_REGISTER_METRIC(EvalMAP, "map")
     .describe("map@k for ranking.")
-    .set_body([](char const* param) {
-      return new EvalMAPScore{"map", param};
-    });
+    .set_body([](char const* param) { return new EvalMAPScore{"map", param}; });
 
 XGBOOST_REGISTER_METRIC(EvalNDCG, "ndcg")
     .describe("ndcg@k for ranking.")
-    .set_body([](char const* param) {
-      return new EvalNDCG{"ndcg", param};
-    });
+    .set_body([](char const* param) { return new EvalNDCG{"ndcg", param}; });
 }  // namespace xgboost::metric

@@ -1,5 +1,5 @@
 /**
- * Copyright 2023-2024, XGBoost Contributors
+ * Copyright 2023-2026, XGBoost Contributors
  */
 #if defined(XGBOOST_USE_NCCL)
 #include <gtest/gtest.h>
@@ -40,7 +40,8 @@ class Worker : public NCCLWorkerForTest {
       auto s_result = common::EraseType(dh::ToSpan(result));
 
       std::vector<std::int64_t> recv_seg(nccl_comm_->World() + 1, 0);
-      rc = nccl_coll_->AllgatherV(*nccl_comm_, s_data, common::Span{sizes.data(), sizes.size()},
+      rc = nccl_coll_->AllgatherV(&ctx_, *nccl_comm_, s_data,
+                                  common::Span{sizes.data(), sizes.size()},
                                   common::Span{recv_seg.data(), recv_seg.size()}, s_result, algo);
       SafeColl(rc);
 
@@ -65,7 +66,8 @@ class Worker : public NCCLWorkerForTest {
       auto s_result = common::EraseType(dh::ToSpan(result));
 
       std::vector<std::int64_t> recv_seg(nccl_comm_->World() + 1, 0);
-      rc = nccl_coll_->AllgatherV(*nccl_comm_, s_data, common::Span{sizes.data(), sizes.size()},
+      rc = nccl_coll_->AllgatherV(&ctx_, *nccl_comm_, s_data,
+                                  common::Span{sizes.data(), sizes.size()},
                                   common::Span{recv_seg.data(), recv_seg.size()}, s_result, algo);
       SafeColl(rc);
       // check segment size
@@ -94,7 +96,7 @@ class MGPUAllgatherTest : public SocketTest {};
 }  // namespace
 
 TEST_F(MGPUAllgatherTest, MGPUTestVRing) {
-  auto n_workers = common::AllVisibleGPUs();
+  auto n_workers = curt::AllVisibleGPUs();
   TestDistributed(n_workers, [=](std::string host, std::int32_t port, std::chrono::seconds timeout,
                                  std::int32_t r) {
     Worker w{host, port, timeout, n_workers, r};
@@ -105,7 +107,7 @@ TEST_F(MGPUAllgatherTest, MGPUTestVRing) {
 }
 
 TEST_F(MGPUAllgatherTest, MGPUTestVBcast) {
-  auto n_workers = common::AllVisibleGPUs();
+  auto n_workers = curt::AllVisibleGPUs();
   TestDistributed(n_workers, [=](std::string host, std::int32_t port, std::chrono::seconds timeout,
                                  std::int32_t r) {
     Worker w{host, port, timeout, n_workers, r};

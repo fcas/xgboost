@@ -6,7 +6,7 @@
     <parent>
         <groupId>ml.dmlc</groupId>
         <artifactId>xgboost-jvm_2.12</artifactId>
-        <version>2.1.0-SNAPSHOT</version>
+        <version>3.5.0-SNAPSHOT</version>
     </parent>
     <name>xgboost4j-spark</name>
     <artifactId>xgboost4j-spark_2.12</artifactId>
@@ -19,6 +19,40 @@
                     <skipAssembly>false</skipAssembly>
                 </configuration>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <configuration>
+                  <createDependencyReducedPom>true</createDependencyReducedPom>
+                  <useDependencyReducedPomInJar>true</useDependencyReducedPomInJar>
+                  <shadedArtifactAttached>false</shadedArtifactAttached>
+                  <artifactSet>
+                    <includes>
+                      <include>ml.dmlc:xgboost4j_${scala.binary.version}</include>
+                    </includes>
+                  </artifactSet>
+                </configuration>
+                <executions>
+                  <execution>
+                    <phase>package</phase>
+                    <goals>
+                      <goal>shade</goal>
+                    </goals>
+                  </execution>
+                </executions>
+              </plugin>
+              <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+                <configuration>
+                  <archive>
+                    <manifestEntries>
+                      <Automatic-Module-Name>ml.dmlc.xgboost4j.spark</Automatic-Module-Name>
+                    </manifestEntries>
+                  </archive>
+                </configuration>
+              </plugin>
         </plugins>
     </build>
     <dependencies>

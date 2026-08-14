@@ -92,12 +92,36 @@ Some other examples:
    split candidates, in which case no split is made. To reduce the effect, you may want to
    increase the ``max_bin`` parameter to consider more split candidates.
 
+===========
+Vector Leaf
+===========
+
+.. versionadded:: 3.4.0
+
+For vector leaves, XGBoost applies the same constraint independently to every output. If
+a target's child weights violate the required order, their constrained optimum is the
+common weight
+
+.. math::
+
+    w_{l,t}=w_{r,t}=p_t
+    =\operatorname{clip}_{[L_{n,t},U_{n,t}]}\left(
+      -\frac{\operatorname{ThresholdL1}(G_{l,t}+G_{r,t},2\alpha)}
+             {H_{l,t}+H_{r,t}+2\lambda}
+    \right).
+
+Here :math:`\operatorname{clip}` applies the inherited bounds.
+
+.. note::
+
+    Reduced gradient doesn't support monotone constraint.
 
 *******************
 Using feature names
 *******************
 
-XGBoost's Python package supports using feature names instead of feature index for
+XGBoost's Python and R packages support using feature names instead of feature indices for
 specifying the constraints. Given a data frame with columns ``["f0", "f1", "f2"]``, the
-monotonic constraint can be specified as ``{"f0": 1, "f2": -1}``, and ``"f1"`` will
+monotonic constraint can be specified as ``{"f0": 1, "f2": -1}`` (Python) or as
+``list(f0=1, f2=-1)`` (R, when using 'xgboost()', but not 'xgb.train'), and ``"f1"`` will
 default to ``0`` (no constraint).

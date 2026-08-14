@@ -1,3 +1,7 @@
+..
+  IMPORTANT: When adding new entries to this file (e.g. a new parameter),
+  the parameter should also be added under file 'R-package/R/xgb.train.R'.
+
 ##################
 XGBoost Parameters
 ##################
@@ -6,7 +10,6 @@ Before running XGBoost, we must set three types of parameters: general parameter
 - **General parameters** relate to which booster we are using to do boosting, commonly tree or linear model
 - **Booster parameters** depend on which booster you have chosen
 - **Learning task parameters** decide on the learning scenario. For example, regression tasks may use different parameters with ranking tasks.
-- **Command line parameters** relate to behavior of CLI version of XGBoost.
 
 .. note:: Parameters in R package
 
@@ -25,14 +28,37 @@ Global Configuration
 The following parameters can be set in the global scope, using :py:func:`xgboost.config_context()` (Python) or ``xgb.set.config()`` (R).
 
 * ``verbosity``: Verbosity of printing messages. Valid values of 0 (silent), 1 (warning), 2 (info), and 3 (debug).
-* ``use_rmm``: Whether to use RAPIDS Memory Manager (RMM) to allocate GPU memory. This option is only applicable when XGBoost is built (compiled) with the RMM plugin enabled. Valid values are ``true`` and ``false``.
+
+* ``use_rmm``:
+
+  .. deprecated:: 3.5.0
+
+    The RMM plugin has been deprecated, use the CUDA async pool instead.
+
+* ``use_cuda_async_pool`` [default=false]
+
+  Whether to use the device memory pool in the CUDA driver. This option is not available
+  if XGBoost is built with RMM support, as it is the same as using the RMM
+  ``CudaAsyncMemoryResource`` pool.
+
+  .. versionadded:: 3.2.0
+
+* ``nthread``: Set the global number of threads for OpenMP. Use this only when you need to
+  override some OpenMP-related environment variables like ``OMP_NUM_THREADS``. Otherwise,
+  the ``nthread`` parameter from the Booster and the DMatrix should be preferred as the
+  former sets the global variable and might cause conflicts with other libraries.
 
 ******************
 General Parameters
 ******************
-* ``booster`` [default= ``gbtree`` ]
+* ``booster`` [default= ``gbtree``]
 
   - Which booster to use. Can be ``gbtree``, ``gblinear`` or ``dart``; ``gbtree`` and ``dart`` use tree based models while ``gblinear`` uses linear functions.
+  - Dropout parameters like ``rate_drop`` can be used directly with tree models. ``booster=dart`` remains supported for compatibility.
+
+  .. deprecated:: 3.3.0
+
+    ``booster=gblinear`` is deprecated and support will be removed in a future release.
 
 * ``device`` [default= ``cpu``]
 
@@ -78,10 +104,10 @@ Parameters for Tree Booster
 
 * ``gamma`` [default=0, alias: ``min_split_loss``]
 
-  - Minimum loss reduction required to make a further partition on a leaf node of the tree. The larger ``gamma`` is, the more conservative the algorithm will be. Note that a tree where no splits were made might still contain a single terminal node with a non-zero score.
+  - Minimum loss reduction required to make a further partition on a leaf node of the tree. The larger ``gamma`` is, the more conservative the algorithm will be. Note that a tree where no splits were made might still contain a single terminal node with a non-zero score. This is the same :math:`\gamma` described in the :doc:`/tutorials/model`.
   - range: [0,∞]
 
-* ``max_depth`` [default=6]
+* ``max_depth`` [default=6, type=int32]
 
   - Maximum depth of a tree. Increasing this value will make the model more complex and more likely to overfit. 0 indicates no limit on depth. Beware that XGBoost aggressively consumes memory when training a deep tree. ``exact`` tree method requires non-zero value.
   - range: [0,∞]
@@ -89,6 +115,7 @@ Parameters for Tree Booster
 * ``min_child_weight`` [default=1]
 
   - Minimum sum of instance weight (hessian) needed in a child. If the tree partition step results in a leaf node with the sum of instance weight less than ``min_child_weight``, then the building process will give up further partitioning. In linear regression task, this simply corresponds to minimum number of instances needed to be in each node. The larger ``min_child_weight`` is, the more conservative the algorithm will be.
+  - With vector leaf, the mean Hessian across targets is used to compare against the ``min_child_weight``.
   - range: [0,∞]
 
 * ``max_delta_step`` [default=0]
@@ -103,14 +130,25 @@ Parameters for Tree Booster
 
 * ``sampling_method`` [default= ``uniform``]
 
+.. versionchanged:: 3.2.0
+
+    XGBoost supports both CPU and GPU for gradient-based sampling.
+
   - The method to use to sample the training instances.
   - ``uniform``: each training instance has an equal probability of being selected. Typically set
     ``subsample`` >= 0.5 for good results.
   - ``gradient_based``: the selection probability for each training instance is proportional to the
     *regularized absolute value* of gradients (more specifically, :math:`\sqrt{g^2+\lambda h^2}`).
     ``subsample`` may be set to as low as 0.1 without loss of model accuracy. Note that this
-    sampling method is only supported when ``tree_method`` is set to ``hist`` and the device is ``cuda``; other tree
+    sampling method is only supported when ``tree_method`` is set to ``hist``; other tree
     methods only support ``uniform`` sampling.
+
+  .. note::
+
+     When working with reduced gradient for multi-target models, the accuracy of
+     gradient-based sampling might be sub-optimal. The sampling is performed using the
+     split gradient, which may not be optimal with the full gradient. Use uniform sampling
+     as an alternative.
 
 * ``colsample_bytree``, ``colsample_bylevel``, ``colsample_bynode`` [default=1]
 
@@ -130,7 +168,7 @@ Parameters for Tree Booster
 
 * ``lambda`` [default=1, alias: ``reg_lambda``]
 
-  - L2 regularization term on weights. Increasing this value will make model more conservative.
+  - L2 regularization term on weights. Increasing this value will make model more conservative. This is the :math:`\lambda` described in the :doc:`/tutorials/model`.
   - range: [0, :math:`\infty`]
 
 * ``alpha`` [default=0, alias: ``reg_alpha``]
@@ -140,7 +178,7 @@ Parameters for Tree Booster
 
 * ``tree_method`` string [default= ``auto``]
 
-  - The tree construction algorithm used in XGBoost. See description in the `reference paper <http://arxiv.org/abs/1603.02754>`_ and :doc:`treemethod`.
+  - The tree construction algorithm used in XGBoost. See description in the `reference paper <https://arxiv.org/abs/1603.02754>`_ and :doc:`treemethod`.
 
   - Choices: ``auto``, ``exact``, ``approx``, ``hist``, this is a combination of commonly
     used updaters.  For other updaters like ``refresh``, set the parameter ``updater``
@@ -164,7 +202,6 @@ Parameters for Tree Booster
     - ``grow_quantile_histmaker``: Grow tree using quantized histogram.
     - ``grow_gpu_hist``:  Enabled when ``tree_method`` is set to ``hist`` along with ``device=cuda``.
     - ``grow_gpu_approx``: Enabled when ``tree_method`` is set to ``approx`` along with ``device=cuda``.
-    - ``sync``: synchronizes trees in all distributed nodes.
     - ``refresh``: refreshes tree's statistics and/or leaf values based on the current data. Note that no random subsampling of data rows is performed.
     - ``prune``: prunes the splits where loss < min_split_loss (or gamma) and nodes that have depth greater than ``max_depth``.
 
@@ -189,11 +226,11 @@ Parameters for Tree Booster
     - ``depthwise``: split at nodes closest to the root.
     - ``lossguide``: split at nodes with highest loss change.
 
-* ``max_leaves`` [default=0]
+* ``max_leaves`` [default=0, type=int32]
 
   - Maximum number of nodes to be added.  Not used by ``exact`` tree method.
 
-* ``max_bin``, [default=256]
+* ``max_bin``, [default=256, type=int32]
 
   - Only used if ``tree_method`` is set to ``hist`` or ``approx``.
   - Maximum number of discrete bins to bucket continuous features.
@@ -226,14 +263,20 @@ Parameters for Tree Booster
     - ``one_output_per_tree``: One model for each target.
     - ``multi_output_tree``:  Use multi-target trees.
 
+
+Parameters for Non-Exact Tree Methods
+=====================================
+
 * ``max_cached_hist_node``, [default = 65536]
 
-  Maximum number of cached nodes for CPU histogram.
+  Maximum number of cached nodes for histogram. This can be used with the ``hist`` and the
+  ``approx`` tree methods.
 
   .. versionadded:: 2.0.0
 
-  - For most of the cases this parameter should not be set except for growing deep trees
-    on CPU.
+  - For most of the cases this parameter should not be set except for growing deep
+    trees. After 3.0, this parameter affects GPU algorithms as well.
+
 
 .. _cat-param:
 
@@ -243,7 +286,7 @@ Parameters for Categorical Feature
 These parameters are only used for training with categorical data. See
 :doc:`/tutorials/categorical` for more information.
 
-.. note:: These parameters are experimental. ``exact`` tree method is not yet supported.
+.. note:: The ``exact`` tree method is not supported for categorical features.
 
 
 * ``max_cat_to_onehot``
@@ -261,19 +304,8 @@ These parameters are only used for training with categorical data. See
   - Maximum number of categories considered for each split. Used only by partition-based
     splits for preventing over-fitting.
 
-Additional parameters for Dart Booster (``booster=dart``)
-=========================================================
-
-.. note:: Using ``predict()`` with DART booster
-
-  If the booster object is DART type, ``predict()`` will perform dropouts, i.e. only
-  some of the trees will be evaluated. This will produce incorrect results if ``data`` is
-  not the training data. To obtain correct results on test sets, set ``iteration_range`` to
-  a nonzero value, e.g.
-
-  .. code-block:: python
-
-    preds = bst.predict(dtest, iteration_range=(0, num_round))
+Additional dropout parameters for tree boosters
+================================================
 
 * ``sample_type`` [default= ``uniform``]
 
@@ -316,6 +348,10 @@ Additional parameters for Dart Booster (``booster=dart``)
 
 Parameters for Linear Booster (``booster=gblinear``)
 ====================================================
+.. deprecated:: 3.3.0
+
+  ``booster=gblinear`` is deprecated and support will be removed in a future release.
+
 * ``lambda`` [default=0, alias: ``reg_lambda``]
 
   - L2 regularization term on weights. Increasing this value will make model more conservative. Normalised to number of training examples.
@@ -323,6 +359,11 @@ Parameters for Linear Booster (``booster=gblinear``)
 * ``alpha`` [default=0, alias: ``reg_alpha``]
 
   - L1 regularization term on weights. Increasing this value will make model more conservative. Normalised to number of training examples.
+
+* ``eta`` [default=0.5, alias: ``learning_rate``]
+
+  - Step size shrinkage used in update to prevent overfitting. After each boosting step, we can directly get the weights of new features, and ``eta`` shrinks the feature weights to make the boosting process more conservative.
+  - range: [0,1]
 
 * ``updater`` [default= ``shotgun``]
 
@@ -356,20 +397,20 @@ Specify the learning task and the corresponding learning objective. The objectiv
   - ``reg:squaredlogerror``: regression with squared log loss :math:`\frac{1}{2}[log(pred + 1) - log(label + 1)]^2`.  All input labels are required to be greater than -1.  Also, see metric ``rmsle`` for possible issue  with this objective.
   - ``reg:logistic``: logistic regression, output probability
   - ``reg:pseudohubererror``: regression with Pseudo Huber loss, a twice differentiable alternative to absolute loss.
-  - ``reg:absoluteerror``: Regression with L1 error. When tree model is used, leaf value is refreshed after tree construction. If used in distributed training, the leaf value is calculated as the mean value from all workers, which is not guaranteed to be optimal.
+  - ``reg:absoluteerror``: Regression with L1 error. A smooth approximation is used to optimize the L1 loss.
 
     .. versionadded:: 1.7.0
 
-  - ``reg:quantileerror``: Quantile loss, also known as ``pinball loss``. See later sections for its parameter and :ref:`sphx_glr_python_examples_quantile_regression.py` for a worked example.
+  - ``reg:quantileerror``: Quantile loss, also known as ``pinball loss``. A smooth approximation is used to optimize the quantile loss. See later sections for its parameter and :ref:`sphx_glr_python_examples_prediction_intervals.py` for a worked example.
 
     .. versionadded:: 2.0.0
+
+  - ``reg:expectileerror``: Expectile loss (asymmetric squared error). See later sections for its parameter and properties.
 
   - ``binary:logistic``: logistic regression for binary classification, output probability
   - ``binary:logitraw``: logistic regression for binary classification, output score before logistic transformation
   - ``binary:hinge``: hinge loss for binary classification. This makes predictions of 0 or 1, rather than producing probabilities.
   - ``count:poisson``: Poisson regression for count data, output mean of Poisson distribution.
-
-    + ``max_delta_step`` is set to 0.7 by default in Poisson regression (used to safeguard optimization)
 
   - ``survival:cox``: Cox regression for right censored survival time data (negative values are considered right censored).
     Note that predictions are returned on the hazard ratio scale (i.e., as HR = exp(marginal_prediction) in the proportional hazard function ``h(t) = h0(t) * HR``).
@@ -377,21 +418,26 @@ Specify the learning task and the corresponding learning objective. The objectiv
     See :doc:`/tutorials/aft_survival_analysis` for details.
   - ``multi:softmax``: set XGBoost to do multiclass classification using the softmax objective, you also need to set num_class(number of classes)
   - ``multi:softprob``: same as softmax, but output a vector of ``ndata * nclass``, which can be further reshaped to ``ndata * nclass`` matrix. The result contains predicted probability of each data point belonging to each class.
-  - ``rank:ndcg``: Use LambdaMART to perform pair-wise ranking where `Normalized Discounted Cumulative Gain (NDCG) <http://en.wikipedia.org/wiki/NDCG>`_ is maximized. This objective supports position debiasing for click data.
-  - ``rank:map``: Use LambdaMART to perform pair-wise ranking where `Mean Average Precision (MAP) <http://en.wikipedia.org/wiki/Mean_average_precision#Mean_average_precision>`_ is maximized
+  - ``rank:ndcg``: Use LambdaMART to perform pair-wise ranking where `Normalized Discounted Cumulative Gain (NDCG) <https://en.wikipedia.org/wiki/NDCG>`_ is maximized. This objective supports position debiasing for click data.
+  - ``rank:map``: Use LambdaMART to perform pair-wise ranking where `Mean Average Precision (MAP) <https://en.wikipedia.org/wiki/Mean_average_precision#Mean_average_precision>`_ is maximized
   - ``rank:pairwise``: Use LambdaRank to perform pair-wise ranking using the `ranknet` objective.
   - ``reg:gamma``: gamma regression with log-link. Output is a mean of gamma distribution. It might be useful, e.g., for modeling insurance claims severity, or for any outcome that might be `gamma-distributed <https://en.wikipedia.org/wiki/Gamma_distribution#Occurrence_and_applications>`_.
   - ``reg:tweedie``: Tweedie regression with log-link. It might be useful, e.g., for modeling total loss in insurance, or for any outcome that might be `Tweedie-distributed <https://en.wikipedia.org/wiki/Tweedie_distribution#Occurrence_and_applications>`_.
 
 * ``base_score``
 
-  - The initial prediction score of all instances, global bias
-  - The parameter is automatically estimated for selected objectives before training. To
-    disable the estimation, specify a real number argument.
-  - If ``base_margin`` is supplied, ``base_score`` will not be added.
-  - For sufficient number of iterations, changing this value will not have too much effect.
+  The initial prediction score of all instances, also known as the global bias, or the intercept.
 
-  See :doc:`/tutorials/intercept` for more info.
+  .. versionchanged:: 3.1.0
+
+    XGBoost is updated to use vector-valued intercept by default.
+
+  - The parameter is automatically estimated for selected objectives before training. To
+    disable the estimation, specify a real number argument, e.g. ``base_score = 0.5``.
+  - If ``base_margin`` is supplied, ``base_score`` will not be used.
+  - If we train the model with a sufficient number of iterations, changing this value does not offer significant benefit.
+
+  See :doc:`/tutorials/intercept` for more information, including different use cases.
 
 * ``eval_metric`` [default according to objective]
 
@@ -400,21 +446,23 @@ Specify the learning task and the corresponding learning objective. The objectiv
 
   - The choices are listed below:
 
-    - ``rmse``: `root mean square error <http://en.wikipedia.org/wiki/Root_mean_square_error>`_
+    - ``rmse``: `root mean square error <https://en.wikipedia.org/wiki/Root_mean_square_error>`_
     - ``rmsle``: root mean square log error: :math:`\sqrt{\frac{1}{N}[log(pred + 1) - log(label + 1)]^2}`. Default metric of ``reg:squaredlogerror`` objective. This metric reduces errors generated by outliers in dataset.  But because ``log`` function is employed, ``rmsle`` might output ``nan`` when prediction value is less than -1.  See ``reg:squaredlogerror`` for other requirements.
     - ``mae``: `mean absolute error <https://en.wikipedia.org/wiki/Mean_absolute_error>`_
     - ``mape``: `mean absolute percentage error <https://en.wikipedia.org/wiki/Mean_absolute_percentage_error>`_
     - ``mphe``: `mean Pseudo Huber error <https://en.wikipedia.org/wiki/Huber_loss>`_. Default metric of ``reg:pseudohubererror`` objective.
-    - ``logloss``: `negative log-likelihood <http://en.wikipedia.org/wiki/Log-likelihood>`_
+    - ``expectile``: Expectile regression error (asymmetric squared error). Default metric of ``reg:expectileerror`` objective.
+    - ``logloss``: `negative log-likelihood <https://en.wikipedia.org/wiki/Log-likelihood>`_
     - ``error``: Binary classification error rate. It is calculated as ``#(wrong cases)/#(all cases)``. For the predictions, the evaluation will regard the instances with prediction value larger than 0.5 as positive instances, and the others as negative instances.
     - ``error@t``: a different than 0.5 binary classification threshold value could be specified by providing a numerical value through 't'.
     - ``merror``: Multiclass classification error rate. It is calculated as ``#(wrong cases)/#(all cases)``.
-    - ``mlogloss``: `Multiclass logloss <http://scikit-learn.org/stable/modules/generated/sklearn.metrics.log_loss.html>`_.
+    - ``mlogloss``: `Multiclass logloss <https://scikit-learn.org/stable/modules/generated/sklearn.metrics.log_loss.html>`_.
     - ``auc``: `Receiver Operating Characteristic Area under the Curve <https://en.wikipedia.org/wiki/Receiver_operating_characteristic#Area_under_the_curve>`_.
       Available for classification and learning-to-rank tasks.
 
       - When used with binary classification, the objective should be ``binary:logistic`` or similar functions that work on probability.
       - When used with multi-class classification, objective should be ``multi:softprob`` instead of ``multi:softmax``, as the latter doesn't output probability.  Also the AUC is calculated by 1-vs-rest with reference class weighted by class prevalence.
+      - When used with multi-label classification, AUC is calculated independently for each target and averaged with the macro method.
       - When used with LTR task, the AUC is computed by comparing pairs of documents to count correctly sorted pairs.  This corresponds to pairwise learning to rank.  The implementation has some issues with average AUC around groups and distributed workers not being well-defined.
       - On a single machine the AUC calculation is exact. In a distributed environment the AUC is a weighted average over the AUC of training rows on each node - therefore, distributed AUC is an approximation sensitive to the distribution of data across workers. Use another metric in distributed environments if precision and reproducibility are important.
       - When input dataset contains only negative or positive samples, the output is `NaN`.  The behavior is implementation defined, for instance, ``scikit-learn`` returns :math:`0.5` instead.
@@ -425,8 +473,8 @@ Specify the learning task and the corresponding learning objective. The objectiv
       After XGBoost 1.6, both of the requirements and restrictions for using ``aucpr`` in classification problem are similar to ``auc``.  For ranking task, only binary relevance label :math:`y \in [0, 1]` is supported.  Different from ``map (mean average precision)``, ``aucpr`` calculates the *interpolated* area under precision recall curve using continuous interpolation.
 
     - ``pre``: Precision at :math:`k`. Supports only learning to rank task.
-    - ``ndcg``: `Normalized Discounted Cumulative Gain <http://en.wikipedia.org/wiki/NDCG>`_
-    - ``map``: `Mean Average Precision <http://en.wikipedia.org/wiki/Mean_average_precision#Mean_average_precision>`_
+    - ``ndcg``: `Normalized Discounted Cumulative Gain <https://en.wikipedia.org/wiki/NDCG>`_
+    - ``map``: `Mean Average Precision <https://en.wikipedia.org/wiki/Mean_average_precision#Mean_average_precision>`_
 
       The `average precision` is defined as:
 
@@ -473,14 +521,28 @@ Parameter for using Pseudo-Huber (``reg:pseudohubererror``)
 Parameter for using Quantile Loss (``reg:quantileerror``)
 =========================================================
 
-* ``quantile_alpha``: A scalar or a list of targeted quantiles.
+* ``quantile_alpha``: A scalar or an ascending list of targeted quantiles.
 
     .. versionadded:: 2.0.0
+
+Parameter for using Expectile Loss (``reg:expectileerror``)
+===========================================================
+
+* ``expectile_alpha``: A scalar or a list of targeted expectiles. Range: [0, 1]. Required for
+  ``reg:expectileerror``.
+
+    .. versionadded:: 3.3.0
+
+    .. note::
+
+        Multiple alphas must be sorted in ascending order. Unlike the quantile objective, expectile does not suffer from curve crossing.
+        When predicting with ``output_margin=True`` and multiple alphas, the first margin corresponds to the smallest alpha; subsequent margins are reparameterized gaps between consecutive expectile predictions, use normal prediction to obtain the actual expectile values.
 
 Parameter for using AFT Survival Loss (``survival:aft``) and Negative Log Likelihood of AFT metric (``aft-nloglik``)
 ====================================================================================================================
 
-* ``aft_loss_distribution``: Probability Density Function, ``normal``, ``logistic``, or ``extreme``.
+* ``aft_loss_distribution``: Probability Density Function for the AFT distribution; ``normal``, ``logistic``, or ``extreme``.
+* ``aft_loss_distribution_scale``: Scaling factor for the AFT distribution. Range: (0,∞)
 
 .. _ltr-param:
 
@@ -506,6 +568,24 @@ These are parameters specific to learning to rank task. See :doc:`Learning to Ra
 
   Whether to normalize the leaf value by lambda gradient. This can sometimes stagnate the training progress.
 
+  .. versionchanged:: 3.0.0
+
+  When the ``mean`` method is used, it's normalized by the ``lambdarank_num_pair_per_sample`` instead of gradient.
+
+* ``lambdarank_score_normalization`` [default = ``true``]
+
+  .. versionadded:: 3.0.0
+
+  Whether to normalize the delta metric by the difference of prediction scores. This can
+  sometimes stagnate the training progress. With pairwise ranking, we can normalize the
+  gradient using the difference between two samples in each pair to reduce influence from
+  the pairs that have large difference in ranking scores. This can help us regularize the
+  model to reduce bias and prevent overfitting. Similar to other regularization
+  techniques, this might prevent training from converging.
+
+  There was no normalization before 2.0. In 2.0 and later versions this is used by
+  default. In 3.0, we made this an option that users can disable.
+
 *  ``lambdarank_unbiased`` [default = ``false``]
 
   Specify whether do we need to debias input click data.
@@ -517,63 +597,3 @@ These are parameters specific to learning to rank task. See :doc:`Learning to Ra
 * ``ndcg_exp_gain`` [default = ``true``]
 
   Whether we should use exponential gain function for ``NDCG``. There are two forms of gain function for ``NDCG``, one is using relevance value directly while the other is using :math:`2^{rel} - 1` to emphasize on retrieving relevant documents. When ``ndcg_exp_gain`` is true (the default), relevance degree cannot be greater than 31.
-
-***********************
-Command Line Parameters
-***********************
-The following parameters are only used in the console version of XGBoost
-
-* ``num_round``
-
-  - The number of rounds for boosting
-
-* ``data``
-
-  - The path of training data
-
-* ``test:data``
-
-  - The path of test data to do prediction
-
-* ``save_period`` [default=0]
-
-  - The period to save the model. Setting ``save_period=10`` means that for every 10 rounds XGBoost will save the model. Setting it to 0 means not saving any model during the training.
-
-* ``task`` [default= ``train``] options: ``train``, ``pred``, ``eval``, ``dump``
-
-  - ``train``: training using data
-  - ``pred``: making prediction for test:data
-  - ``eval``: for evaluating statistics specified by ``eval[name]=filename``
-  - ``dump``: for dump the learned model into text format
-
-* ``model_in`` [default=NULL]
-
-  - Path to input model, needed for ``test``, ``eval``, ``dump`` tasks. If it is specified in training, XGBoost will continue training from the input model.
-
-* ``model_out`` [default=NULL]
-
-  - Path to output model after training finishes. If not specified, XGBoost will output files with such names as ``0003.model`` where ``0003`` is number of boosting rounds.
-
-* ``model_dir`` [default= ``models/``]
-
-  - The output directory of the saved models during training
-
-* ``fmap``
-
-  - Feature map, used for dumping model
-
-* ``dump_format`` [default= ``text``] options: ``text``, ``json``
-
-  - Format of model dump file
-
-* ``name_dump`` [default= ``dump.txt``]
-
-  - Name of model dump file
-
-* ``name_pred`` [default= ``pred.txt``]
-
-  - Name of prediction file, used in pred mode
-
-* ``pred_margin`` [default=0]
-
-  - Predict margin instead of transformed probability

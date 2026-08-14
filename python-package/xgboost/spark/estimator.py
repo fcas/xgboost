@@ -1,20 +1,19 @@
 """Xgboost pyspark integration submodule for estimator API."""
 
-# pylint: disable=too-many-ancestors
-# pylint: disable=fixme, too-many-ancestors, protected-access, no-member, invalid-name
+# pylint: disable=protected-access, no-member
 # pylint: disable=unused-argument, too-many-locals
 
-import warnings
 from typing import Any, List, Optional, Type, Union
 
 import numpy as np
 from pyspark import keyword_only
 from pyspark.ml.param import Param, Params
 from pyspark.ml.param.shared import HasProbabilityCol, HasRawPredictionCol
+from pyspark.sql import SparkSession
 
-from xgboost import XGBClassifier, XGBRanker, XGBRegressor
-
-from .core import (  # type: ignore
+from ..collective import Config
+from ..sklearn import XGBClassifier, XGBRanker, XGBRegressor
+from .core import (  # type: ignore[attr-defined]
     _ClassificationModel,
     _SparkXGBEstimator,
     _SparkXGBModel,
@@ -78,12 +77,6 @@ def _set_pyspark_xgb_cls_param_attrs(
         set_param_attrs(name, param_obj)
 
 
-def _deprecated_use_gpu() -> None:
-    warnings.warn(
-        "`use_gpu` is deprecated since 2.0.0, use `device` instead", FutureWarning
-    )
-
-
 class SparkXGBRegressor(_SparkXGBEstimator):
     """SparkXGBRegressor is a PySpark ML estimator. It implements the XGBoost regression
     algorithm based on XGBoost python library, and it can be used in PySpark Pipeline
@@ -141,11 +134,6 @@ class SparkXGBRegressor(_SparkXGBEstimator):
     num_workers:
         How many XGBoost workers to be used to train.
         Each XGBoost worker corresponds to one spark task.
-    use_gpu:
-        .. deprecated:: 2.0.0
-
-        Use `device` instead.
-
     device:
 
         .. versionadded:: 2.0.0
@@ -161,6 +149,11 @@ class SparkXGBRegressor(_SparkXGBEstimator):
         Boolean value to specify if enabling sparse data optimization, if True,
         Xgboost DMatrix object will be constructed from sparse matrix instead of
         dense matrix.
+    launch_tracker_on_driver:
+        Boolean value to indicate whether the tracker should be launched on the driver side or
+        the executor side.
+    coll_cfg:
+        The collective configuration. See :py:class:`~xgboost.collective.Config`
 
     kwargs:
         A dictionary of xgboost parameters, please refer to
@@ -210,17 +203,16 @@ class SparkXGBRegressor(_SparkXGBEstimator):
         weight_col: Optional[str] = None,
         base_margin_col: Optional[str] = None,
         num_workers: int = 1,
-        use_gpu: Optional[bool] = None,
         device: Optional[str] = None,
         force_repartition: bool = False,
         repartition_random_shuffle: bool = False,
         enable_sparse_data_optim: bool = False,
+        launch_tracker_on_driver: Optional[bool] = None,
+        coll_cfg: Optional[Config] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         input_kwargs = self._input_kwargs
-        if use_gpu:
-            _deprecated_use_gpu()
         self.setParams(**input_kwargs)
 
     @classmethod
@@ -231,8 +223,8 @@ class SparkXGBRegressor(_SparkXGBEstimator):
     def _pyspark_model_cls(cls) -> Type["SparkXGBRegressorModel"]:
         return SparkXGBRegressorModel
 
-    def _validate_params(self) -> None:
-        super()._validate_params()
+    def _validate_params(self, spark_session: SparkSession) -> None:
+        super()._validate_params(spark_session)
         if self.isDefined(self.qid_col):
             raise ValueError(
                 "Spark Xgboost regressor estimator does not support `qid_col` param."
@@ -321,11 +313,6 @@ class SparkXGBClassifier(_SparkXGBEstimator, HasProbabilityCol, HasRawPrediction
     num_workers:
         How many XGBoost workers to be used to train.
         Each XGBoost worker corresponds to one spark task.
-    use_gpu:
-        .. deprecated:: 2.0.0
-
-        Use `device` instead.
-
     device:
 
         .. versionadded:: 2.0.0
@@ -341,6 +328,11 @@ class SparkXGBClassifier(_SparkXGBEstimator, HasProbabilityCol, HasRawPrediction
         Boolean value to specify if enabling sparse data optimization, if True,
         Xgboost DMatrix object will be constructed from sparse matrix instead of
         dense matrix.
+    launch_tracker_on_driver:
+        Boolean value to indicate whether the tracker should be launched on the driver side or
+        the executor side.
+    coll_cfg:
+        The collective configuration. See :py:class:`~xgboost.collective.Config`
 
     kwargs:
         A dictionary of xgboost parameters, please refer to
@@ -390,11 +382,12 @@ class SparkXGBClassifier(_SparkXGBEstimator, HasProbabilityCol, HasRawPrediction
         weight_col: Optional[str] = None,
         base_margin_col: Optional[str] = None,
         num_workers: int = 1,
-        use_gpu: Optional[bool] = None,
         device: Optional[str] = None,
         force_repartition: bool = False,
         repartition_random_shuffle: bool = False,
         enable_sparse_data_optim: bool = False,
+        launch_tracker_on_driver: Optional[bool] = None,
+        coll_cfg: Optional[Config] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -403,8 +396,6 @@ class SparkXGBClassifier(_SparkXGBEstimator, HasProbabilityCol, HasRawPrediction
         # binary or multinomial input dataset, and we need to remove the fixed default
         # param value as well to avoid causing ambiguity.
         input_kwargs = self._input_kwargs
-        if use_gpu:
-            _deprecated_use_gpu()
         self.setParams(**input_kwargs)
         self._setDefault(objective=None)
 
@@ -416,8 +407,8 @@ class SparkXGBClassifier(_SparkXGBEstimator, HasProbabilityCol, HasRawPrediction
     def _pyspark_model_cls(cls) -> Type["SparkXGBClassifierModel"]:
         return SparkXGBClassifierModel
 
-    def _validate_params(self) -> None:
-        super()._validate_params()
+    def _validate_params(self, spark_session: SparkSession) -> None:
+        super()._validate_params(spark_session)
         if self.isDefined(self.qid_col):
             raise ValueError(
                 "Spark Xgboost classifier estimator does not support `qid_col` param."
@@ -504,11 +495,6 @@ class SparkXGBRanker(_SparkXGBEstimator):
     num_workers:
         How many XGBoost workers to be used to train.
         Each XGBoost worker corresponds to one spark task.
-    use_gpu:
-        .. deprecated:: 2.0.0
-
-        Use `device` instead.
-
     device:
 
         .. versionadded:: 2.0.0
@@ -524,6 +510,11 @@ class SparkXGBRanker(_SparkXGBEstimator):
         Boolean value to specify if enabling sparse data optimization, if True,
         Xgboost DMatrix object will be constructed from sparse matrix instead of
         dense matrix.
+    launch_tracker_on_driver:
+        Boolean value to indicate whether the tracker should be launched on the driver side or
+        the executor side.
+    coll_cfg:
+        The collective configuration. See :py:class:`~xgboost.collective.Config`
 
     kwargs:
         A dictionary of xgboost parameters, please refer to
@@ -579,17 +570,16 @@ class SparkXGBRanker(_SparkXGBEstimator):
         base_margin_col: Optional[str] = None,
         qid_col: Optional[str] = None,
         num_workers: int = 1,
-        use_gpu: Optional[bool] = None,
         device: Optional[str] = None,
         force_repartition: bool = False,
         repartition_random_shuffle: bool = False,
         enable_sparse_data_optim: bool = False,
+        launch_tracker_on_driver: Optional[bool] = None,
+        coll_cfg: Optional[Config] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         input_kwargs = self._input_kwargs
-        if use_gpu:
-            _deprecated_use_gpu()
         self.setParams(**input_kwargs)
 
     @classmethod
@@ -600,8 +590,8 @@ class SparkXGBRanker(_SparkXGBEstimator):
     def _pyspark_model_cls(cls) -> Type["SparkXGBRankerModel"]:
         return SparkXGBRankerModel
 
-    def _validate_params(self) -> None:
-        super()._validate_params()
+    def _validate_params(self, spark_session: SparkSession) -> None:
+        super()._validate_params(spark_session)
         if not self.isDefined(self.qid_col):
             raise ValueError(
                 "Spark Xgboost ranker estimator requires setting `qid_col` param."

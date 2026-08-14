@@ -1,5 +1,5 @@
 /**
- * Copyright 2014-2023 by XGBoost Contributors
+ * Copyright 2014-2026, XGBoost Contributors
  *
  * \brief Context object used for controlling runtime parameters.
  */
@@ -10,11 +10,23 @@
 #include <iterator>   // for distance
 #include <optional>   // for optional
 #include <regex>      // for regex_replace, regex_match
+#include <sstream>    // for stringstream
 
-#include "common/common.h"     // AssertGPUSupport
-#include "common/error_msg.h"  // WarnDeprecatedGPUId
+#include "common/cuda_rt_utils.h"  // for AllVisibleGPUs
+#include "common/random.h"
 #include "common/threading_utils.h"
+#include "xgboost/json.h"  // for Json, Object, String, ToJson, FromJson
 #include "xgboost/string_view.h"
+
+#if !defined(XGBOOST_USE_CUDA)
+
+#include "common/common.h"  // for AssertGPUSupport
+
+#endif  // !defined(XGBOOST_USE_CUDA)
+
+#if defined(XGBOOST_USE_SYCL)
+#include "../plugin/sycl/context_helper.h"
+#endif  // defined (XGBOOST_USE_SYCL)
 
 namespace xgboost {
 
@@ -37,7 +49,7 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
 [[nodiscard]] DeviceOrd CUDAOrdinal(DeviceOrd device, bool fail_on_invalid) {
   // When booster is loaded from a memory image (Python pickle or R raw model), number of
   // available GPUs could be different.  Wrap around it.
-  std::int32_t n_visible = common::AllVisibleGPUs();
+  std::int32_t n_visible = curt::AllVisibleGPUs();
   if (n_visible == 0) {
     if (device.IsCUDA()) {
       LOG(WARNING) << "No visible GPU is found, setting device to CPU.";
@@ -54,7 +66,7 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
   }
 
   if (device.IsCUDA()) {
-    common::SetDevice(device.ordinal);
+    curt::SetDevice(device.ordinal);
   }
   return device;
 }
@@ -91,6 +103,12 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
 }
 
 [[nodiscard]] DeviceOrd MakeDeviceOrd(std::string const& input, bool fail_on_invalid_gpu_id) {
+  // Fast path for the most common case. `device=cpu` is re-parsed on hot paths
+  // (e.g. DMatrixProxy::SetArray during inplace prediction), and the general
+  // path below costs two regex constructions plus string copies per call.
+  if (input == DeviceSym::CPU()) {
+    return DeviceOrd::CPU();
+  }
   StringView msg{R"(Invalid argument for `device`. Expected to be one of the following:
 - cpu
 - cuda
@@ -98,7 +116,9 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
 - gpu
 - gpu:<device ordinal>   # e.g. gpu:0
 )"};
-  auto fatal = [&] { LOG(FATAL) << msg << "Got: `" << input << "`."; };
+  auto fatal = [&] {
+    LOG(FATAL) << msg << "Got: `" << input << "`.";
+  };
 
 #if defined(__MINGW32__)
   // mingw hangs on regex using rtools 430. Basic checks only.
@@ -107,7 +127,8 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
   bool valid = substr == "cpu" || substr == "cud" || substr == "gpu" || substr == "syc";
   CHECK(valid) << msg;
 #else
-  std::regex pattern{"gpu(:[0-9]+)?|cuda(:[0-9]+)?|cpu|sycl(:cpu|:gpu)?(:-1|:[0-9]+)?"};
+  thread_local static std::regex pattern{
+      "gpu(:[0-9]+)?|cuda(:[0-9]+)?|cpu|sycl(:cpu|:gpu)?(:-1|:[0-9]+)?"};
   if (!std::regex_match(input, pattern)) {
     fatal();
   }
@@ -118,20 +139,21 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
   // mingw hangs on regex using rtools 430. Basic checks only.
   bool is_sycl = (substr == "syc");
 #else
-  bool is_sycl = std::regex_match(input, std::regex("sycl(:cpu|:gpu)?(:-1|:[0-9]+)?"));
+  thread_local static std::regex sycl_pattern{"sycl(:cpu|:gpu)?(:-1|:[0-9]+)?"};
+  bool is_sycl = std::regex_match(input, sycl_pattern);
 #endif  // defined(__MINGW32__)
 
   std::string s_device = input;
   if (!is_sycl) {
-    s_device = std::regex_replace(s_device, std::regex{"gpu"}, DeviceSym::CUDA());
+    thread_local static std::regex gpu_pattern{"gpu"};
+    s_device = std::regex_replace(s_device, gpu_pattern, DeviceSym::CUDA());
   }
 
   auto split_it = std::find(s_device.cbegin(), s_device.cend(), ':');
 
   // For these cases we need to move iterator to the end, not to look for a ordinal.
-  if ((s_device == "sycl:cpu") ||
-      (s_device == "sycl:gpu")) {
-        split_it = s_device.cend();
+  if ((s_device == "sycl:cpu") || (s_device == "sycl:gpu")) {
+    split_it = s_device.cend();
   }
 
   // For s_device like "sycl:gpu:1"
@@ -191,8 +213,12 @@ DeviceOrd CUDAOrdinal(DeviceOrd device, bool) {
   }
   if (device.IsCUDA()) {
     device = CUDAOrdinal(device, fail_on_invalid_gpu_id);
+    if (!device.IsCUDA()) {
+      // We allow loading a GPU-based pickle on a CPU-only machine.
+      LOG(WARNING) << "Device is changed from GPU to CPU as we couldn't find any available GPU on "
+                      "the system.";
+    }
   }
-
   return device;
 }
 }  // namespace
@@ -219,36 +245,17 @@ void Context::Init(Args const& kwargs) {
   }
 }
 
-void Context::ConfigureGpuId(bool require_gpu) {
-  if (this->IsCPU() && require_gpu) {
-    this->UpdateAllowUnknown(Args{{kDevice, DeviceSym::CUDA()}});
-  }
-}
-
 void Context::SetDeviceOrdinal(Args const& kwargs) {
   auto gpu_id_it = std::find_if(kwargs.cbegin(), kwargs.cend(),
                                 [](auto const& p) { return p.first == "gpu_id"; });
   auto has_gpu_id = gpu_id_it != kwargs.cend();
+  if (has_gpu_id) {
+    LOG(FATAL) << "`gpu_id` has been removed since 3.1. Use `device` instead.";
+  }
+
   auto device_it = std::find_if(kwargs.cbegin(), kwargs.cend(),
                                 [](auto const& p) { return p.first == kDevice; });
   auto has_device = device_it != kwargs.cend();
-  if (has_device && has_gpu_id) {
-    LOG(FATAL) << "Both `device` and `gpu_id` are specified. Use `device` instead.";
-  }
-
-  if (has_gpu_id) {
-    // Compatible with XGBoost < 2.0.0
-    error::WarnDeprecatedGPUId();
-    auto opt_id = ParseInt(StringView{gpu_id_it->second});
-    CHECK(opt_id.has_value()) << "Invalid value for `gpu_id`. Got:" << gpu_id_it->second;
-    if (opt_id.value() > DeviceOrd::CPUOrdinal()) {
-      this->UpdateAllowUnknown(Args{{kDevice, DeviceOrd::CUDA(opt_id.value()).Name()}});
-    } else {
-      this->UpdateAllowUnknown(Args{{kDevice, DeviceOrd::CPU().Name()}});
-    }
-    return;
-  }
-
   auto new_d = MakeDeviceOrd(this->device, this->fail_on_invalid_gpu_id);
 
   if (!has_device) {
@@ -269,6 +276,25 @@ std::int32_t Context::Threads() const {
     n_threads = std::min(n_threads, cfs_cpu_count_);
   }
   return n_threads;
+}
+
+DeviceOrd Context::DeviceFP64() const {
+#if defined(XGBOOST_USE_SYCL)
+  return sycl::DeviceFP64(device_);
+#else
+  return device_;
+#endif  // defined(XGBOOST_USE_SYCL)
+}
+
+[[nodiscard]] Json Context::ToJson() const {
+  auto obj = Json{::xgboost::ToJson(*this)};
+  common::SaveRng(&obj, this->rng_);
+  return obj;
+}
+
+void Context::FromJson(Json const& in) {
+  ::xgboost::FromJson(in, this);
+  common::LoadRng(in, &this->rng_);
 }
 
 #if !defined(XGBOOST_USE_CUDA)

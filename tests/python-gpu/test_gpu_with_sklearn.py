@@ -1,26 +1,29 @@
 import itertools
 import json
 import os
-import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, List, Tuple
 
 import numpy as np
 import pytest
-
 import xgboost as xgb
 from xgboost import testing as tm
 from xgboost.testing.ranking import run_ranking_categorical, run_ranking_qid_df
-
-sys.path.append("tests/python")
-import test_with_sklearn as twskl  # noqa
+from xgboost.testing.with_skl import (
+    run_boost_from_prediction_binary,
+    run_boost_from_prediction_multi_clasas,
+    run_housing_rf_regression,
+    run_intercept,
+    run_recoding,
+)
 
 pytestmark = pytest.mark.skipif(**tm.no_sklearn())
 
 rng = np.random.RandomState(1994)
 
 
-def test_gpu_binary_classification():
+def test_gpu_binary_classification() -> None:
     from sklearn.datasets import load_digits
     from sklearn.model_selection import KFold
 
@@ -31,8 +34,15 @@ def test_gpu_binary_classification():
     for cls in (xgb.XGBClassifier, xgb.XGBRFClassifier):
         for train_index, test_index in kf.split(X, y):
             xgb_model = cls(
-                random_state=42, tree_method="gpu_hist", n_estimators=4, gpu_id="0"
+                random_state=42,
+                tree_method="hist",
+                n_estimators=4,
+                device="cuda",
             ).fit(X[train_index], y[train_index])
+            cfg: str = json.loads(xgb_model.get_booster().save_config())["learner"][
+                "generic_param"
+            ]["device"]
+            assert cfg.startswith("cuda")
             preds = xgb_model.predict(X[test_index])
             labels = y[test_index]
             err = sum(
@@ -43,75 +53,78 @@ def test_gpu_binary_classification():
 
 @pytest.mark.skipif(**tm.no_cupy())
 @pytest.mark.skipif(**tm.no_cudf())
-def test_boost_from_prediction_gpu_hist():
+@pytest.mark.parametrize("tree_method", ["hist", "approx"])
+def test_boost_from_prediction_gpu_hist(tree_method: str) -> None:
     import cudf
     import cupy as cp
     from sklearn.datasets import load_breast_cancer, load_digits
 
-    tree_method = "gpu_hist"
     X, y = load_breast_cancer(return_X_y=True)
     X, y = cp.array(X), cp.array(y)
 
-    twskl.run_boost_from_prediction_binary(tree_method, X, y, None)
-    twskl.run_boost_from_prediction_binary(tree_method, X, y, cudf.DataFrame)
+    run_boost_from_prediction_binary(tree_method, "cuda", X, y, None)
+    run_boost_from_prediction_binary(tree_method, "cuda", X, y, cudf.DataFrame)
 
     X, y = load_digits(return_X_y=True)
     X, y = cp.array(X), cp.array(y)
 
-    twskl.run_boost_from_prediction_multi_clasas(
-        xgb.XGBClassifier, tree_method, X, y, None
+    run_boost_from_prediction_multi_clasas(
+        xgb.XGBClassifier, tree_method, "cuda", X, y, None
     )
-    twskl.run_boost_from_prediction_multi_clasas(
-        xgb.XGBClassifier, tree_method, X, y, cudf.DataFrame
+    run_boost_from_prediction_multi_clasas(
+        xgb.XGBClassifier, tree_method, "cuda", X, y, cudf.DataFrame
     )
 
 
-def test_num_parallel_tree():
-    twskl.run_housing_rf_regression("gpu_hist")
+def test_num_parallel_tree() -> None:
+    run_housing_rf_regression("hist", "cuda")
 
 
 @pytest.mark.skipif(**tm.no_pandas())
 @pytest.mark.skipif(**tm.no_cudf())
 @pytest.mark.skipif(**tm.no_sklearn())
-def test_categorical():
+def test_categorical(tmp_path: Path) -> None:
     import cudf
     import cupy as cp
     import pandas as pd
     from sklearn.datasets import load_svmlight_file
 
     data_dir = tm.data_dir(__file__)
-    X, y = load_svmlight_file(os.path.join(data_dir, "agaricus.txt.train"))
+    X, y = load_svmlight_file(
+        os.path.join(data_dir, "agaricus.txt.train"), dtype=np.float32
+    )
     clf = xgb.XGBClassifier(
-        tree_method="gpu_hist",
-        enable_categorical=True,
+        tree_method="hist",
+        device="cuda",
         n_estimators=10,
     )
     X = pd.DataFrame(X.todense()).astype("category")
+    for c in X.columns:
+        X[c] = X[c].cat.rename_categories(int)
     clf.fit(X, y)
 
-    with tempfile.TemporaryDirectory() as tempdir:
-        model = os.path.join(tempdir, "categorial.json")
-        clf.save_model(model)
+    model = tmp_path / "categorial.json"
+    clf.save_model(model)
 
-        with open(model) as fd:
-            categorical = json.load(fd)
-            categories_sizes = np.array(
-                categorical["learner"]["gradient_booster"]["model"]["trees"][0][
-                    "categories_sizes"
-                ]
-            )
-            assert categories_sizes.shape[0] != 0
-            np.testing.assert_allclose(categories_sizes, 1)
-
-    def check_predt(X, y):
-        reg = xgb.XGBRegressor(
-            tree_method="gpu_hist", enable_categorical=True, n_estimators=64
+    with open(model) as fd:
+        categorical = json.load(fd)
+        categories_sizes = np.array(
+            categorical["learner"]["gradient_booster"]["model"]["trees"][0][
+                "categories_sizes"
+            ]
         )
+        assert categories_sizes.shape[0] != 0
+        np.testing.assert_allclose(categories_sizes, 1)
+
+    def check_predt(X: Any, y: List[float]) -> None:
+        reg = xgb.XGBRegressor(tree_method="hist", n_estimators=64, device="cuda")
         reg.fit(X, y)
         predts = reg.predict(X)
         booster = reg.get_booster()
-        assert "c" in booster.feature_types
-        assert len(booster.feature_types) == 1
+        feature_types = booster.feature_types
+        assert feature_types is not None
+        assert "c" in feature_types
+        assert len(feature_types) == 1
         inp_predts = booster.inplace_predict(X)
         if isinstance(inp_predts, cp.ndarray):
             inp_predts = cp.asnumpy(inp_predts)
@@ -128,7 +141,7 @@ def test_categorical():
 
 @pytest.mark.skipif(**tm.no_cupy())
 @pytest.mark.skipif(**tm.no_cudf())
-def test_classififer():
+def test_classififer() -> None:
     import cudf
     import cupy as cp
     from sklearn.datasets import load_digits
@@ -193,15 +206,12 @@ def test_custom_objective(
     }
 
     obj = tm.softprob_obj(y.max() + 1, use_cupy=use_cupy, order=order, gdtype=gdtype)
+    assert callable(obj)
 
     clf = xgb.XGBClassifier(objective=obj, **params)
 
     if strategy == "multi_output_tree" and tree_method == "approx":
         with pytest.raises(ValueError, match=r"Only the hist"):
-            clf.fit(X, y)
-        return
-    if strategy == "multi_output_tree" and device == "cuda":
-        with pytest.raises(ValueError, match=r"GPU is not yet"):
             clf.fit(X, y)
         return
 
@@ -214,7 +224,9 @@ def test_custom_objective(
 
     params["n_estimators"] = 2
 
-    def wrong_shape(labels, predt):
+    def wrong_shape(
+        labels: np.ndarray, predt: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         grad, hess = obj(labels, predt)
         return grad[:, :-1], hess[:, :-1]
 
@@ -222,7 +234,9 @@ def test_custom_objective(
         clf = xgb.XGBClassifier(objective=wrong_shape, **params)
         clf.fit(X, y)
 
-    def wrong_shape_1(labels, predt):
+    def wrong_shape_1(
+        labels: np.ndarray, predt: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         grad, hess = obj(labels, predt)
         return grad[:-1, :], hess[:-1, :]
 
@@ -230,7 +244,9 @@ def test_custom_objective(
         clf = xgb.XGBClassifier(objective=wrong_shape_1, **params)
         clf.fit(X, y)
 
-    def wrong_shape_2(labels, predt):
+    def wrong_shape_2(
+        labels: np.ndarray, predt: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         grad, hess = obj(labels, predt)
         return grad[:, :], hess[:-1, :]
 
@@ -238,7 +254,9 @@ def test_custom_objective(
         clf = xgb.XGBClassifier(objective=wrong_shape_2, **params)
         clf.fit(X, y)
 
-    def wrong_shape_3(labels, predt):
+    def wrong_shape_3(
+        labels: np.ndarray, predt: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         grad, hess = obj(labels, predt)
         grad = grad.reshape(grad.size)
         hess = hess.reshape(hess.size)
@@ -250,10 +268,10 @@ def test_custom_objective(
 
 
 @pytest.mark.skipif(**tm.no_cudf())
-def test_ranking_qid_df():
+def test_ranking_qid_df() -> None:
     import cudf
 
-    run_ranking_qid_df(cudf, "gpu_hist")
+    run_ranking_qid_df(cudf, "hist", "cuda")
 
 
 @pytest.mark.skipif(**tm.no_pandas())
@@ -302,3 +320,12 @@ def test_device_ordinal() -> None:
             fut.result()
 
     cp.cuda.runtime.setDevice(0)
+
+
+@pytest.mark.skipif(**tm.no_cudf())
+def test_recoding() -> None:
+    run_recoding("cuda")
+
+
+def test_intercept() -> None:
+    run_intercept("cuda")

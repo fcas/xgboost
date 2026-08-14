@@ -1,7 +1,8 @@
 /**
- * Copyright 2018-2023 by XGBoost Contributors
+ * Copyright 2018-2025, XGBoost Contributors
  */
 #include <gtest/gtest.h>
+#include <xgboost/gradient.h>  // for GradientContainer
 #include <xgboost/host_device_vector.h>
 #include <xgboost/task.h>  // for ObjInfo
 #include <xgboost/tree_updater.h>
@@ -19,15 +20,22 @@ TEST(Updater, Refresh) {
   bst_feature_t constexpr kCols = 16;
   Context ctx;
 
-  linalg::Matrix<GradientPair> gpair
-      {{ {0.23f, 0.24f}, {0.23f, 0.24f}, {0.23f, 0.24f}, {0.23f, 0.24f},
-         {0.27f, 0.29f}, {0.27f, 0.29f}, {0.27f, 0.29f}, {0.27f, 0.29f} }, {8, 1}, ctx.Device()};
+  GradientContainer gpair;
+  gpair.gpair = linalg::Matrix<GradientPair>{{{0.23f, 0.24f},
+                                              {0.23f, 0.24f},
+                                              {0.23f, 0.24f},
+                                              {0.23f, 0.24f},
+                                              {0.27f, 0.29f},
+                                              {0.27f, 0.29f},
+                                              {0.27f, 0.29f},
+                                              {0.27f, 0.29f}},
+                                             {8, 1},
+                                             ctx.Device()};
+
   std::shared_ptr<DMatrix> p_dmat{
-    RandomDataGenerator{kRows, kCols, 0.4f}.Seed(3).GenerateDMatrix()};
+      RandomDataGenerator{kRows, kCols, 0.4f}.Seed(3).GenerateDMatrix()};
   std::vector<std::pair<std::string, std::string>> cfg{
-      {"reg_alpha", "0.0"},
-      {"num_feature", std::to_string(kCols)},
-      {"reg_lambda", "1"}};
+      {"reg_alpha", "0.0"}, {"num_feature", std::to_string(kCols)}, {"reg_lambda", "1"}};
 
   RegTree tree = RegTree{1u, kCols};
   std::vector<RegTree*> trees{&tree};
@@ -43,7 +51,7 @@ TEST(Updater, Refresh) {
   tree.Stat(cleft).base_weight = 1.2;
   tree.Stat(cright).base_weight = 1.3;
 
-  std::vector<HostDeviceVector<bst_node_t>> position;
+  std::vector<HostDeviceVector<bst_node_t>> position(trees.size());
   tree::TrainParam param;
   param.UpdateAllowUnknown(cfg);
 
@@ -51,7 +59,7 @@ TEST(Updater, Refresh) {
 
   bst_float constexpr kEps = 1e-6;
   ASSERT_NEAR(-0.183392, tree[cright].LeafValue(), kEps);
-  ASSERT_NEAR(-0.224489, tree.Stat(0).loss_chg, kEps);
+  ASSERT_NEAR(-0.167978, tree.Stat(0).loss_chg, kEps);
   ASSERT_NEAR(0, tree.Stat(cleft).loss_chg, kEps);
   ASSERT_NEAR(0, tree.Stat(1).loss_chg, kEps);
   ASSERT_NEAR(0, tree.Stat(2).loss_chg, kEps);

@@ -1,5 +1,5 @@
 /**
- * Copyright 2015-2024, XGBoost Contributors
+ * Copyright 2015-2026, XGBoost Contributors
  * \file base.h
  * \brief Defines configuration macros and basic types for xgboost.
  */
@@ -7,6 +7,8 @@
 #define XGBOOST_BASE_H_
 
 #include <dmlc/omp.h>  // for omp_uint, omp_ulong
+// Put the windefs here to guard as many files as possible.
+#include <xgboost/windefs.h>
 
 #include <cstdint>  // for int32_t, uint64_t, int16_t
 #include <ostream>  // for ostream
@@ -32,13 +34,6 @@
 #endif  // XGBOOST_LOG_WITH_TIME
 
 /*!
- * \brief Whether to customize global PRNG.
- */
-#ifndef XGBOOST_CUSTOMIZE_GLOBAL_PRNG
-#define XGBOOST_CUSTOMIZE_GLOBAL_PRNG 0
-#endif  // XGBOOST_CUSTOMIZE_GLOBAL_PRNG
-
-/*!
  * \brief Check if alignas(*) keyword is supported. (g++ 4.8 or higher)
  */
 #if defined(__GNUC__) && ((__GNUC__ == 4 && __GNUC_MINOR__ >= 8) || __GNUC__ > 4)
@@ -48,7 +43,7 @@
 #endif  // defined(__GNUC__) && ((__GNUC__ == 4 && __GNUC_MINOR__ >= 8) || __GNUC__ > 4)
 
 #if defined(__GNUC__)
-#define XGBOOST_EXPECT(cond, ret)  __builtin_expect((cond), (ret))
+#define XGBOOST_EXPECT(cond, ret) __builtin_expect((cond), (ret))
 #else
 #define XGBOOST_EXPECT(cond, ret) (cond)
 #endif  // defined(__GNUC__)
@@ -56,7 +51,7 @@
 /*!
  * \brief Tag function as usable by device
  */
-#if defined (__CUDA__) || defined(__NVCC__)
+#if defined(__CUDA__) || defined(__NVCC__)
 #define XGBOOST_DEVICE __host__ __device__
 #else
 #define XGBOOST_DEVICE
@@ -70,13 +65,20 @@
 #define XGBOOST_DEV_INLINE
 #endif  // defined(__CUDA__) || defined(__CUDACC__)
 
+// restrict
+#if defined(_MSC_VER)
+#define XGBOOST_RESTRICT __restrict
+#else
+#define XGBOOST_RESTRICT __restrict__
+#endif
+
 // These check are for Makefile.
 #if !defined(XGBOOST_MM_PREFETCH_PRESENT) && !defined(XGBOOST_BUILTIN_PREFETCH_PRESENT)
 /* default logic for software pre-fetching */
 #if (defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_AMD64))) || defined(__INTEL_COMPILER)
 // Enable _mm_prefetch for Intel compiler and MSVC+x86
-  #define XGBOOST_MM_PREFETCH_PRESENT
-  #define XGBOOST_BUILTIN_PREFETCH_PRESENT
+#define XGBOOST_MM_PREFETCH_PRESENT
+#define XGBOOST_BUILTIN_PREFETCH_PRESENT
 #elif defined(__GNUC__)
 // Enable __builtin_prefetch for GCC
 #define XGBOOST_BUILTIN_PREFETCH_PRESENT
@@ -103,9 +105,13 @@ using bst_bin_t = std::int32_t;  // NOLINT
  * @brief Type for data row index (sample).
  */
 using bst_idx_t = std::uint64_t;  // NOLINT
-/*! \brief Type for tree node index. */
-using bst_node_t = std::int32_t;      // NOLINT
-/*! \brief Type for ranking group index. */
+/**
+ * \brief Type for tree node index and tree depth.
+ */
+using bst_node_t = std::int32_t;  // NOLINT
+/**
+ * @brief Type for ranking group index.
+ */
 using bst_group_t = std::uint32_t;  // NOLINT
 /**
  * @brief Type for indexing into output targets.
@@ -116,7 +122,7 @@ using bst_target_t = std::uint32_t;  // NOLINT
  */
 using bst_layer_t = std::int32_t;  // NOLINT
 /**
- * \brief Type for indexing trees.
+ * @brief Type for indexing trees.
  */
 using bst_tree_t = std::int32_t;  // NOLINT
 /**
@@ -141,13 +147,9 @@ class GradientPairInternal {
  public:
   using ValueT = T;
 
-  inline void Add(const ValueT& grad, const ValueT& hess) {
+  inline void Add(const ValueT &grad, const ValueT &hess) {
     grad_ += grad;
     hess_ += hess;
-  }
-
-  inline static void Reduce(GradientPairInternal<T>& a, const GradientPairInternal<T>& b) { // NOLINT(*)
-    a += b;
   }
 
   GradientPairInternal() = default;
@@ -174,30 +176,26 @@ class GradientPairInternal {
   XGBOOST_DEVICE T GetGrad() const { return grad_; }
   XGBOOST_DEVICE T GetHess() const { return hess_; }
 
-  XGBOOST_DEVICE GradientPairInternal<T> &operator+=(
-      const GradientPairInternal<T> &rhs) {
+  XGBOOST_DEVICE GradientPairInternal<T> &operator+=(const GradientPairInternal<T> &rhs) {
     grad_ += rhs.grad_;
     hess_ += rhs.hess_;
     return *this;
   }
 
-  XGBOOST_DEVICE GradientPairInternal<T> operator+(
-      const GradientPairInternal<T> &rhs) const {
+  XGBOOST_DEVICE GradientPairInternal<T> operator+(const GradientPairInternal<T> &rhs) const {
     GradientPairInternal<T> g;
     g.grad_ = grad_ + rhs.grad_;
     g.hess_ = hess_ + rhs.hess_;
     return g;
   }
 
-  XGBOOST_DEVICE GradientPairInternal<T> &operator-=(
-      const GradientPairInternal<T> &rhs) {
+  XGBOOST_DEVICE GradientPairInternal<T> &operator-=(const GradientPairInternal<T> &rhs) {
     grad_ -= rhs.grad_;
     hess_ -= rhs.hess_;
     return *this;
   }
 
-  XGBOOST_DEVICE GradientPairInternal<T> operator-(
-      const GradientPairInternal<T> &rhs) const {
+  XGBOOST_DEVICE GradientPairInternal<T> operator-(const GradientPairInternal<T> &rhs) const {
     GradientPairInternal<T> g;
     g.grad_ = grad_ - rhs.grad_;
     g.hess_ = hess_ - rhs.hess_;
@@ -235,12 +233,10 @@ class GradientPairInternal {
   }
 
   XGBOOST_DEVICE explicit GradientPairInternal(int value) {
-    *this = GradientPairInternal<T>(static_cast<float>(value),
-                                    static_cast<float>(value));
+    *this = GradientPairInternal<T>(static_cast<float>(value), static_cast<float>(value));
   }
 
-  friend std::ostream &operator<<(std::ostream &os,
-                                  const GradientPairInternal<T> &g) {
+  friend std::ostream &operator<<(std::ostream &os, const GradientPairInternal<T> &g) {
     os << g.GetGrad() << "/" << g.GetHess();
     return os;
   }
@@ -309,8 +305,8 @@ class GradientPairInt64 {
 
 using Args = std::vector<std::pair<std::string, std::string> >;
 
-/*! \brief small eps gap for minimum split decision. */
-constexpr bst_float kRtEps = 1e-6f;
+/** @brief small eps gap for minimum split decision. */
+constexpr inline float kRtEps = 1e-6f;
 
 /*! \brief define unsigned long for openmp loop */
 using omp_ulong = dmlc::omp_ulong;  // NOLINT

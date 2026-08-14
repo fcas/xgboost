@@ -10,7 +10,6 @@ Contents
 --------
 - [Code Examples](#code-examples)
   - [Features Walkthrough](#features-walkthrough)
-  - [Basic Examples by Tasks](#basic-examples-by-tasks)
   - [Benchmarks](#benchmarks)
 - [Machine Learning Challenge Winning Solutions](#machine-learning-challenge-winning-solutions)
 - [Tutorials](#tutorials)
@@ -22,48 +21,35 @@ Contents
 
 Code Examples
 -------------
+
 ### Features Walkthrough
+
+_Note: for the R package, see the in-package examples and vignettes instead_
+
+_Note: For the Python package, see [Feature Walk through](https://xgboost.readthedocs.io/en/stable/python/examples/index.html)._
 
 This is a list of short codes introducing different functionalities of xgboost packages.
 
 * Basic walkthrough of packages
   [python](guide-python/basic_walkthrough.py)
-  [R](../R-package/demo/basic_walkthrough.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/basic_walkthrough.jl)
-  [PHP](https://github.com/bpachev/xgboost-php/blob/master/demo/titanic_demo.php)
 * Customize loss function, and evaluation metric
   [python](guide-python/custom_objective.py)
-  [R](../R-package/demo/custom_objective.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/custom_objective.jl)
 * Boosting from existing prediction
   [python](guide-python/boost_from_prediction.py)
-  [R](../R-package/demo/boost_from_prediction.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/boost_from_prediction.jl)
 * Predicting using first n trees
   [python](guide-python/predict_first_ntree.py)
-  [R](../R-package/demo/predict_first_ntree.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/predict_first_ntree.jl)
 * Generalized Linear Model
   [python](guide-python/generalized_linear_model.py)
-  [R](../R-package/demo/generalized_linear_model.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/generalized_linear_model.jl)
 * Cross validation
   [python](guide-python/cross_validation.py)
-  [R](../R-package/demo/cross_validation.R)
   [Julia](https://github.com/antinucleon/XGBoost.jl/blob/master/demo/cross_validation.jl)
 * Predicting leaf indices
   [python](guide-python/predict_leaf_indices.py)
-  [R](../R-package/demo/predict_leaf_indices.R)
-
-### Basic Examples by Tasks
-
-Most of examples in this section are based on CLI or python version.
-However, the parameter settings can be applied to all versions
-
-- [Binary classification](CLI/binary_classification)
-- [Multiclass classification](multiclass_classification)
-- [Regression](CLI/regression)
-- [Learning to Rank](rank)
 
 ### Benchmarks
 
@@ -78,6 +64,7 @@ XGBoost is extensively used by machine learning practitioners to create state of
 this is a list of machine learning winning solutions with XGBoost.
 Please send pull requests if you find ones that are missing here.
 
+- Gábor Melis, 1st place winner of [Kaggle Higgs competition](https://github.com/ghl3/higgs-kaggle) conducted between May and September 2014. Link to [discussion](http://no2147483647.wordpress.com/2014/09/17/winning-solution-of-kaggle-higgs-competition-what-a-single-model-can-do/), [code](https://github.com/phunterlau/kaggle_higgs) and [news article](https://atlas.cern/updates/news/machine-learning-wins-higgs-challenge)
 - Bishwarup Bhattacharjee, 1st place winner of [Allstate Claims Severity](https://www.kaggle.com/competitions/allstate-claims-severity/overview) conducted on December 2016. Link to [discussion](https://www.kaggle.com/competitions/allstate-claims-severity/discussion/26416)
 - Benedikt Schifferer, Gilberto Titericz, Chris Deotte, Christof Henkel, Kazuki Onodera, Jiwei Liu, Bojan Tunguz, Even Oldridge, Gabriel De Souza Pereira Moreira and Ahmet Erdem, 1st place winner of [Twitter RecSys Challenge 2020](https://recsys-twitter.com/) conducted from June,20-August,20. [GPU Accelerated Feature Engineering and Training for Recommender Systems](https://medium.com/rapids-ai/winning-solution-of-recsys2020-challenge-gpu-accelerated-feature-engineering-and-training-for-cd67c5a87b1f)
 - Eugene Khvedchenya,Jessica Fridrich, Jan Butora, Yassine Yousfi 1st place winner in [ALASKA2 Image Steganalysis](https://www.kaggle.com/c/alaska2-image-steganalysis/overview). Link to [discussion](https://www.kaggle.com/c/alaska2-image-steganalysis/discussion/168546)
@@ -104,6 +91,11 @@ Please send pull requests if you find ones that are missing here.
 - David Austin, Weimin Wang, 1st place winner in [Iceberg-classifier-challenge](https://www.kaggle.com/c/statoil-iceberg-classifier-challenge/leaderboard) Link to [discussion](https://www.kaggle.com/c/statoil-iceberg-classifier-challenge/discussion/48241)
 - Kazuki Onodera, Kazuki Fujikawa, 2nd place winner in [OpenVaccine: COVID-19 mRNA Vaccine Degradation Prediction](https://www.kaggle.com/c/stanford-covid-vaccine/overview) Link to [Discussion](https://www.kaggle.com/c/stanford-covid-vaccine/discussion/189709)
 - Prarthana Bhat, 2nd place winner in [DYD Competition](https://datahack.analyticsvidhya.com/contest/date-your-data/). Link to [Solution](https://github.com/analyticsvidhya/DateYourData/blob/master/Prathna_Bhat_Model.R).
+- Sergey Saharovskiy, 2nd place winner of [Tabular Playground Series - Dec 2021](https://www.kaggle.com/competitions/tabular-playground-series-dec-2021). The final soft-voting ensemble included three XGBoost models. Link to [writeup](https://www.kaggle.com/competitions/tabular-playground-series-dec-2021/writeups/sergey-saharovskiy-2-place-winning-solution).
+- Benedikt Schifferer, Chris Deotte, Gilberto Titericz, Bo Liu, 1st place winner of [ACM RecSys Challenge 2021](https://recsys.acm.org/recsys21/challenge/). An ensemble of 5 XGBoost models and 3 neural networks. Link to [writeup](https://medium.com/nvidia-merlin/winning-the-recsys2021-challenge-by-a-diverse-set-of-xgboost-and-neural-network-models-4c5422a642d8) and [paper](https://dl.acm.org/doi/10.1145/3487572.3487605).
+- Chris Deotte, 1st place winner of [Kaggle Playground Series S5E2 - Backpack Prediction Challenge](https://www.kaggle.com/competitions/playground-series-s5e2) (Feb 2025). A single XGBoost model with 500 engineered features. Link to [discussion](https://www.kaggle.com/competitions/playground-series-s5e2/discussion/565539).
+- Chris Deotte, 1st place winner of [Kaggle Playground Series S5E4 - Predict Podcast Listening Time](https://www.kaggle.com/competitions/playground-series-s5e4) (Apr 2025). A three-level ensemble that includes XGBoost/GBDT models. Link to [writeup](https://www.kaggle.com/competitions/playground-series-s5e4/writeups/chris-deotte-1st-place-rapids-cuml-stack-3-levels) and [technical blog](https://developer.nvidia.com/blog/grandmaster-pro-tip-winning-first-place-in-a-kaggle-competition-with-stacking-using-cuml/).
+- Mohammad Odeh, 1st place winner of [March Machine Learning Mania 2025](https://www.kaggle.com/competitions/march-machine-learning-mania-2025) ($50K prize). XGBoost outperformed CatBoost and LightGBM. Link to [writeup](https://www.kaggle.com/competitions/march-machine-learning-mania-2025/writeups/mohammad-odeh-first-place-solution).
 
 ## Talks
 - XGBoost: A Scalable Tree Boosting System ([video] (https://www.youtube.com/watch?v=Vly8xGnNiWs) + [slides](https://speakerdeck.com/datasciencela/tianqi-chen-xgboost-overview-and-latest-news-la-meetup-talk)) by Tianqi Chen at the Los Angeles Data Science meetup

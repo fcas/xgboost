@@ -3,17 +3,14 @@ change without notice.
 
 """
 
-# pylint: disable=invalid-name,missing-function-docstring,import-error
-import gc
+# pylint: disable=missing-function-docstring
 import importlib.util
-import multiprocessing
 import os
 import platform
 import queue
 import socket
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from io import StringIO
 from platform import system
@@ -24,7 +21,6 @@ from typing import (
     Generator,
     List,
     Optional,
-    Sequence,
     Set,
     Tuple,
     TypedDict,
@@ -39,14 +35,21 @@ from scipy import sparse
 import xgboost as xgb
 from xgboost import RabitTracker
 from xgboost.core import ArrayLike
-from xgboost.sklearn import SklObjective
-from xgboost.testing.data import (
+
+from .._typing import PathLike
+from .data import (
+    IteratorForTest,
     get_california_housing,
     get_cancer,
     get_digits,
     get_sparse,
-    memory,
+    make_batches,
+    make_categorical,
+    make_sparse_regression,
 )
+
+# Used to be defined in this top level module.
+from .utils import non_decreasing, non_increasing  # NOLINT
 
 hypothesis = pytest.importorskip("hypothesis")
 
@@ -67,9 +70,10 @@ def has_ipv6() -> bool:
 
     if socket.has_ipv6:
         try:
-            with socket.socket(
-                socket.AF_INET6, socket.SOCK_STREAM
-            ) as server, socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as client:
+            with (
+                socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server,
+                socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as client,
+            ):
                 server.bind(("::1", 0))
                 port = server.getsockname()[1]
                 server.listen()
@@ -111,9 +115,11 @@ def no_sklearn() -> PytestSkip:
 
 
 def no_dask() -> PytestSkip:
-    if sys.platform.startswith("win"):
-        return {"reason": "Unsupported platform.", "condition": True}
     return no_mod("dask")
+
+
+def no_loky() -> PytestSkip:
+    return no_mod("loky")
 
 
 def no_dask_ml() -> PytestSkip:
@@ -136,12 +142,19 @@ def no_arrow() -> PytestSkip:
     return no_mod("pyarrow")
 
 
+def no_polars() -> PytestSkip:
+    return no_mod("polars")
+
+
 def no_modin() -> PytestSkip:
-    return no_mod("modin")
+    try:
+        import modin.pandas as md
 
+        md.DataFrame([[1, 2.0, True], [2, 3.0, False]], columns=["a", "b", "c"])
 
-def no_dt() -> PytestSkip:
-    return no_mod("datatable")
+    except ImportError:
+        return {"reason": "Failed import modin.", "condition": True}
+    return {"reason": "Failed import modin.", "condition": True}
 
 
 def no_matplotlib() -> PytestSkip:
@@ -163,15 +176,20 @@ def no_cudf() -> PytestSkip:
 
 
 def no_cupy() -> PytestSkip:
-    return no_mod("cupy")
+    skip_cupy = no_mod("cupy")
+    if not skip_cupy["condition"] and system() == "Windows":
+        import cupy as cp
+
+        # Cupy might run into issue on Windows due to missing compiler
+        try:
+            cp.array([1, 2, 3]).sum()
+        except Exception:  # pylint: disable=broad-except
+            skip_cupy["condition"] = True
+    return skip_cupy
 
 
 def no_dask_cudf() -> PytestSkip:
     return no_mod("dask_cudf")
-
-
-def no_json_schema() -> PytestSkip:
-    return no_mod("jsonschema")
 
 
 def no_graphviz() -> PytestSkip:
@@ -193,90 +211,8 @@ def no_multiple(*args: Any) -> PytestSkip:
     return {"condition": condition, "reason": reason}
 
 
-def skip_s390x() -> PytestSkip:
-    condition = platform.machine() == "s390x"
-    reason = "Known to fail on s390x"
-    return {"condition": condition, "reason": reason}
-
-
-class IteratorForTest(xgb.core.DataIter):
-    """Iterator for testing streaming DMatrix. (external memory, quantile)"""
-
-    def __init__(
-        self,
-        X: Sequence,
-        y: Sequence,
-        w: Optional[Sequence],
-        cache: Optional[str],
-    ) -> None:
-        assert len(X) == len(y)
-        self.X = X
-        self.y = y
-        self.w = w
-        self.it = 0
-        super().__init__(cache_prefix=cache)
-
-    def next(self, input_data: Callable) -> int:
-        if self.it == len(self.X):
-            return 0
-
-        with pytest.raises(TypeError, match="Keyword argument"):
-            input_data(self.X[self.it], self.y[self.it], None)
-
-        # Use copy to make sure the iterator doesn't hold a reference to the data.
-        input_data(
-            data=self.X[self.it].copy(),
-            label=self.y[self.it].copy(),
-            weight=self.w[self.it].copy() if self.w else None,
-        )
-        gc.collect()  # clear up the copy, see if XGBoost access freed memory.
-        self.it += 1
-        return 1
-
-    def reset(self) -> None:
-        self.it = 0
-
-    def as_arrays(
-        self,
-    ) -> Tuple[Union[np.ndarray, sparse.csr_matrix], ArrayLike, Optional[ArrayLike]]:
-        if isinstance(self.X[0], sparse.csr_matrix):
-            X = sparse.vstack(self.X, format="csr")
-        else:
-            X = np.concatenate(self.X, axis=0)
-        y = np.concatenate(self.y, axis=0)
-        if self.w:
-            w = np.concatenate(self.w, axis=0)
-        else:
-            w = None
-        return X, y, w
-
-
-def make_batches(
-    n_samples_per_batch: int,
-    n_features: int,
-    n_batches: int,
-    use_cupy: bool = False,
-    *,
-    vary_size: bool = False,
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
-    X = []
-    y = []
-    w = []
-    if use_cupy:
-        import cupy
-
-        rng = cupy.random.RandomState(1994)
-    else:
-        rng = np.random.RandomState(1994)
-    for i in range(n_batches):
-        n_samples = n_samples_per_batch + i * 10 if vary_size else n_samples_per_batch
-        _X = rng.randn(n_samples, n_features)
-        _y = rng.randn(n_samples)
-        _w = rng.uniform(low=0, high=1, size=n_samples)
-        X.append(_X)
-        y.append(_y)
-        w.append(_w)
-    return X, y, w
+def skip_win() -> PytestSkip:
+    return {"reason": "Unsupported platform.", "condition": is_windows()}
 
 
 def make_regression(
@@ -371,103 +307,16 @@ class TestDataset:
                 weight.append(w)
 
         it = IteratorForTest(
-            predictor, response, weight if weight else None, cache="cache"
+            predictor,
+            response,
+            weight if weight else None,
+            cache="cache",
+            on_host=False,
         )
         return xgb.DMatrix(it)
 
     def __repr__(self) -> str:
         return self.name
-
-
-# pylint: disable=too-many-arguments,too-many-locals
-@memory.cache
-def make_categorical(
-    n_samples: int,
-    n_features: int,
-    n_categories: int,
-    onehot: bool,
-    sparsity: float = 0.0,
-    cat_ratio: float = 1.0,
-    shuffle: bool = False,
-) -> Tuple[ArrayLike, np.ndarray]:
-    """Generate categorical features for test.
-
-    Parameters
-    ----------
-    n_categories:
-        Number of categories for categorical features.
-    onehot:
-        Should we apply one-hot encoding to the data?
-    sparsity:
-        The ratio of the amount of missing values over the number of all entries.
-    cat_ratio:
-        The ratio of features that are categorical.
-    shuffle:
-        Whether we should shuffle the columns.
-
-    Returns
-    -------
-    X, y
-    """
-    import pandas as pd
-    from pandas.api.types import is_categorical_dtype
-
-    rng = np.random.RandomState(1994)
-
-    pd_dict = {}
-    for i in range(n_features + 1):
-        c = rng.randint(low=0, high=n_categories, size=n_samples)
-        pd_dict[str(i)] = pd.Series(c, dtype=np.int64)
-
-    df = pd.DataFrame(pd_dict)
-    label = df.iloc[:, 0]
-    df = df.iloc[:, 1:]
-    for i in range(0, n_features):
-        label += df.iloc[:, i]
-    label += 1
-
-    categories = np.arange(0, n_categories)
-    for col in df.columns:
-        if rng.binomial(1, cat_ratio, size=1)[0] == 1:
-            df[col] = df[col].astype("category")
-            df[col] = df[col].cat.set_categories(categories)
-
-    if sparsity > 0.0:
-        for i in range(n_features):
-            index = rng.randint(
-                low=0, high=n_samples - 1, size=int(n_samples * sparsity)
-            )
-            df.iloc[index, i] = np.nan
-            if is_categorical_dtype(df.dtypes[i]):
-                assert n_categories == np.unique(df.dtypes[i].categories).size
-
-    if onehot:
-        df = pd.get_dummies(df)
-
-    if shuffle:
-        columns = list(df.columns)
-        rng.shuffle(columns)
-        df = df[columns]
-
-    return df, label
-
-
-def make_ltr(
-    n_samples: int, n_features: int, n_query_groups: int, max_rel: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Make a dataset for testing LTR."""
-    rng = np.random.default_rng(1994)
-    X = rng.normal(0, 1.0, size=n_samples * n_features).reshape(n_samples, n_features)
-    y = np.sum(X, axis=1)
-    y -= y.min()
-    y = np.round(y / y.max() * max_rel).astype(np.int32)
-
-    qid = rng.integers(0, n_query_groups, size=n_samples, dtype=np.int32)
-    w = rng.normal(0, 1.0, size=n_query_groups)
-    w -= np.min(w)
-    w /= np.max(w)
-    qid = np.sort(qid)
-    return X, y, qid, w
 
 
 def _cat_sampled_from() -> strategies.SearchStrategy:
@@ -494,7 +343,9 @@ def _cat_sampled_from() -> strategies.SearchStrategy:
         sparsity = args[3]
         return TestDataset(
             f"{n_samples}x{n_features}-{n_cats}-{sparsity}",
-            lambda: make_categorical(n_samples, n_features, n_cats, False, sparsity),
+            lambda: make_categorical(
+                n_samples, n_features, n_cats, onehot=False, sparsity=sparsity
+            ),
             "reg:squarederror",
             "rmse",
         )
@@ -503,95 +354,6 @@ def _cat_sampled_from() -> strategies.SearchStrategy:
 
 
 categorical_dataset_strategy: strategies.SearchStrategy = _cat_sampled_from()
-
-
-# pylint: disable=too-many-locals
-@memory.cache
-def make_sparse_regression(
-    n_samples: int, n_features: int, sparsity: float, as_dense: bool
-) -> Tuple[Union[sparse.csr_matrix], np.ndarray]:
-    """Make sparse matrix.
-
-    Parameters
-    ----------
-
-    as_dense:
-
-      Return the matrix as np.ndarray with missing values filled by NaN
-
-    """
-    if not hasattr(np.random, "default_rng"):
-        # old version of numpy on s390x
-        rng = np.random.RandomState(1994)
-        X = sparse.random(
-            m=n_samples,
-            n=n_features,
-            density=1.0 - sparsity,
-            random_state=rng,
-            format="csr",
-        )
-        y = rng.normal(loc=0.0, scale=1.0, size=n_samples)
-        return X, y
-
-    # Use multi-thread to speed up the generation, convenient if you use this function
-    # for benchmarking.
-    n_threads = min(multiprocessing.cpu_count(), n_features)
-
-    def random_csc(t_id: int) -> sparse.csc_matrix:
-        rng = np.random.default_rng(1994 * t_id)
-        thread_size = n_features // n_threads
-        if t_id == n_threads - 1:
-            n_features_tloc = n_features - t_id * thread_size
-        else:
-            n_features_tloc = thread_size
-
-        X = sparse.random(
-            m=n_samples,
-            n=n_features_tloc,
-            density=1.0 - sparsity,
-            random_state=rng,
-        ).tocsc()
-        y = np.zeros((n_samples, 1))
-
-        for i in range(X.shape[1]):
-            size = X.indptr[i + 1] - X.indptr[i]
-            if size != 0:
-                y += X[:, i].toarray() * rng.random((n_samples, 1)) * 0.2
-
-        return X, y
-
-    futures = []
-    with ThreadPoolExecutor(max_workers=n_threads) as executor:
-        for i in range(n_threads):
-            futures.append(executor.submit(random_csc, i))
-
-    X_results = []
-    y_results = []
-    for f in futures:
-        X, y = f.result()
-        X_results.append(X)
-        y_results.append(y)
-
-    assert len(y_results) == n_threads
-
-    csr: sparse.csr_matrix = sparse.hstack(X_results, format="csr")
-    y = np.asarray(y_results)
-    y = y.reshape((y.shape[0], y.shape[1])).T
-    y = np.sum(y, axis=1)
-
-    assert csr.shape[0] == n_samples
-    assert csr.shape[1] == n_features
-    assert y.shape[0] == n_samples
-
-    if as_dense:
-        arr = csr.toarray()
-        assert arr.shape[0] == n_samples
-        assert arr.shape[1] == n_features
-        arr[arr == 0] = np.nan
-        return arr, y
-
-    return csr, y
-
 
 sparse_datasets_strategy = strategies.sampled_from(
     [
@@ -716,29 +478,32 @@ multi_dataset_strategy = make_datasets_with_margin(
 )()
 
 
-def non_increasing(L: Sequence[float], tolerance: float = 1e-4) -> bool:
-    return all((y - x) < tolerance for x, y in zip(L, L[1:]))
-
-
-def predictor_equal(lhs: xgb.DMatrix, rhs: xgb.DMatrix) -> bool:
-    """Assert whether two DMatrices contain the same predictors."""
-    lcsr = lhs.get_data()
-    rcsr = rhs.get_data()
-    return all(
-        (
-            np.array_equal(lcsr.data, rcsr.data),
-            np.array_equal(lcsr.indices, rcsr.indices),
-            np.array_equal(lcsr.indptr, rcsr.indptr),
-        )
-    )
-
-
 M = TypeVar("M", xgb.Booster, xgb.XGBModel)
 
 
-def eval_error_metric(predt: np.ndarray, dtrain: xgb.DMatrix) -> Tuple[str, np.float64]:
-    """Evaluation metric for xgb.train"""
+def logregobj(preds: np.ndarray, dtrain: xgb.DMatrix) -> Tuple[np.ndarray, np.ndarray]:
+    """Binary regression custom objective."""
+    labels = dtrain.get_label()
+    preds = 1.0 / (1.0 + np.exp(-preds))
+    grad = preds - labels
+    hess = preds * (1.0 - preds)
+    return grad, hess
+
+
+def eval_error_metric(
+    predt: np.ndarray, dtrain: xgb.DMatrix, rev_link: bool
+) -> Tuple[str, np.float64]:
+    """Evaluation metric for xgb.train.
+
+    Parameters
+    ----------
+    rev_link : Whether the metric needs to apply the reverse link function (activation).
+
+    """
     label = dtrain.get_label()
+    if rev_link:
+        predt = 1.0 / (1.0 + np.exp(-predt))
+    assert (0.0 <= predt).all() and (predt <= 1.0).all()
     r = np.zeros(predt.shape)
     gt = predt > 0.5
     if predt.size == 0:
@@ -749,8 +514,15 @@ def eval_error_metric(predt: np.ndarray, dtrain: xgb.DMatrix) -> Tuple[str, np.f
     return "CustomErr", np.sum(r)
 
 
-def eval_error_metric_skl(y_true: np.ndarray, y_score: np.ndarray) -> np.float64:
+def eval_error_metric_skl(
+    y_true: np.ndarray, y_score: np.ndarray, rev_link: bool = False
+) -> np.float64:
     """Evaluation metric that looks like metrics provided by sklearn."""
+
+    if rev_link:
+        y_score = 1.0 / (1.0 + np.exp(-y_score))
+    assert (0.0 <= y_score).all() and (y_score <= 1.0).all()
+
     r = np.zeros(y_score.shape)
     gt = y_score > 0.5
     r[gt] = 1 - y_true[gt]
@@ -772,7 +544,7 @@ def softmax(x: np.ndarray) -> np.ndarray:
 
 def softprob_obj(
     classes: int, use_cupy: bool = False, order: str = "C", gdtype: str = "float32"
-) -> SklObjective:
+) -> Callable[[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
     """Custom softprob objective for testing.
 
     Parameters
@@ -820,7 +592,7 @@ def ls_obj(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Least squared error."""
     grad = y_pred - y_true
-    hess = np.ones(len(y_true))
+    hess = np.ones(grad.shape)
     if sample_weight is not None:
         grad *= sample_weight
         hess *= sample_weight
@@ -833,7 +605,7 @@ class DirectoryExcursion:
 
     """
 
-    def __init__(self, path: Union[os.PathLike, str], cleanup: bool = False):
+    def __init__(self, path: PathLike, cleanup: bool = False):
         self.path = path
         self.curdir = os.path.normpath(os.path.abspath(os.path.curdir))
         self.cleanup = cleanup
@@ -917,12 +689,6 @@ def setup_rmm_pool(_: Any, pytestconfig: pytest.Config) -> None:
         )
 
 
-def get_client_workers(client: Any) -> List[str]:
-    "Get workers from a dask client."
-    workers = client.scheduler_info()["workers"]
-    return list(workers.keys())
-
-
 def demo_dir(path: str) -> str:
     """Look for the demo directory based on the test file name."""
     path = normpath(os.path.dirname(path))
@@ -968,27 +734,18 @@ def run_with_rabit(
             exception_queue.put(e)
 
     tracker = RabitTracker(host_ip="127.0.0.1", n_workers=world_size)
-    tracker.start(world_size)
+    tracker.start()
 
     workers = []
     for _ in range(world_size):
-        worker = threading.Thread(target=run_worker, args=(tracker.worker_envs(),))
+        worker = threading.Thread(target=run_worker, args=(tracker.worker_args(),))
         workers.append(worker)
         worker.start()
     for worker in workers:
         worker.join()
         assert exception_queue.empty(), f"Worker failed: {exception_queue.get()}"
 
-    tracker.join()
-
-
-def column_split_feature_names(
-    feature_names: List[Union[str, int]], world_size: int
-) -> List[str]:
-    """Get the global list of feature names from the local feature names."""
-    return [
-        f"{rank}.{feature}" for rank in range(world_size) for feature in feature_names
-    ]
+    tracker.wait_for()
 
 
 def is_windows() -> bool:

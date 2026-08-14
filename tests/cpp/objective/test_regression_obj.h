@@ -1,8 +1,7 @@
 /**
- * Copyright 2020-2023 by XGBoost Contributors
+ * Copyright 2020-2026, XGBoost Contributors
  */
-#ifndef XGBOOST_TEST_REGRESSION_OBJ_H_
-#define XGBOOST_TEST_REGRESSION_OBJ_H_
+#pragma once
 
 #include <xgboost/context.h>  // for Context
 
@@ -18,6 +17,28 @@ void TestLogisticRegressionBasic(const Context* ctx);
 
 void TestsLogisticRawGPair(const Context* ctx);
 
-}  // namespace xgboost
+void TestPoissonRegressionGPair(const Context* ctx);
 
-#endif  // XGBOOST_TEST_REGRESSION_OBJ_H_
+void TestPoissonRegressionBasic(const Context* ctx);
+
+void TestGammaRegressionGPair(const Context* ctx);
+
+void TestGammaRegressionBasic(const Context* ctx);
+
+void TestTweedieRegressionGPair(const Context* ctx);
+
+void TestTweedieRegressionBasic(const Context* ctx);
+
+void TestCoxRegressionGPair(const Context* ctx);
+
+void TestAbsoluteError(const Context* ctx);
+
+void TestPseudoHuber(const Context* ctx);
+
+void TestExpectileRegressionGPair(const Context* ctx);
+
+void TestExpectileRegressionMultiAlpha(const Context* ctx);
+
+void TestExpectileRegressionInitEstimation(const Context* ctx);
+
+}  // namespace xgboost

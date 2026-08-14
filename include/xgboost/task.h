@@ -1,12 +1,10 @@
-/*!
- * Copyright 2021-2022 by XGBoost Contributors
+/**
+ * Copyright 2021-2024, XGBoost Contributors
  */
 #ifndef XGBOOST_TASK_H_
 #define XGBOOST_TASK_H_
 
-#include <xgboost/base.h>
-
-#include <cinttypes>
+#include <cstdint>  // for uint8_t
 
 namespace xgboost {
 /*!
@@ -23,7 +21,7 @@ namespace xgboost {
  */
 struct ObjInfo {
   // What kind of problem are we trying to solve
-  enum Task : uint8_t {
+  enum Task : std::uint8_t {
     kRegression = 0,
     kBinary = 1,
     kClassification = 2,
@@ -33,15 +31,9 @@ struct ObjInfo {
   } task;
   // Does the objective have constant hessian value?
   bool const_hess{false};
-  bool zero_hess{false};
 
   ObjInfo(Task t) : task{t} {}  // NOLINT
-  ObjInfo(Task t, bool khess, bool zhess) : task{t}, const_hess{khess}, zero_hess(zhess) {}
-
-  /**
-   * \brief Use adaptive tree if the objective doesn't have valid hessian value.
-   */
-  XGBOOST_DEVICE bool UpdateTreeLeaf() const { return zero_hess; }
+  ObjInfo(Task t, bool khess) : task{t}, const_hess{khess} {}
 };
 }  // namespace xgboost
 #endif  // XGBOOST_TASK_H_

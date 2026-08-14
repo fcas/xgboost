@@ -1,5 +1,5 @@
 /**
- * Copyright 2021-2024, XGBoost contributors
+ * Copyright 2021-2026, XGBoost contributors
  *
  * \brief Implementation for the approx tree method.
  */
@@ -19,15 +19,16 @@
 #include "common_row_partitioner.h"          // for CommonRowPartitioner
 #include "dmlc/registry.h"                   // for DMLC_REGISTRY_FILE_TAG
 #include "driver.h"                          // for Driver
-#include "hist/evaluate_splits.h"            // for HistEvaluator, UpdatePredictionCacheImpl
+#include "hist/evaluate_splits.h"            // for HistEvaluator
 #include "hist/expand_entry.h"               // for CPUExpandEntry
+#include "hist/hist_param.h"                 // for HistMakerTrainParam
 #include "hist/histogram.h"                  // for MultiHistogramBuilder
-#include "hist/param.h"                      // for HistMakerTrainParam
-#include "hist/sampler.h"                    // for SampleGradient
+#include "hist/sampler.h"                    // for Sampler
 #include "param.h"                           // for GradStats, TrainParam
 #include "xgboost/base.h"                    // for Args, GradientPair, bst_node_t, bst_bin_t
 #include "xgboost/context.h"                 // for Context
 #include "xgboost/data.h"                    // for DMatrix, BatchSet, BatchIterator, MetaInfo
+#include "xgboost/gradient.h"                // for GradientContainer
 #include "xgboost/host_device_vector.h"      // for HostDeviceVector
 #include "xgboost/json.h"                    // for Object, Json, FromJson, ToJson, get
 #include "xgboost/linalg.h"                  // for Matrix, MakeTensorView, Empty, MatrixView
@@ -52,7 +53,7 @@ auto BatchSpec(TrainParam const &p, common::Span<float> hess) {
 }
 }  // anonymous namespace
 
-class GloablApproxBuilder {
+class GlobalApproxBuilder {
  protected:
   TrainParam const *param_;
   HistMakerTrainParam const *hist_param_{nullptr};
@@ -68,7 +69,7 @@ class GloablApproxBuilder {
   common::Monitor *monitor_;
   size_t n_batches_{0};
   // Cache for histogram cuts.
-  common::HistogramCuts feature_values_;
+  common::HistogramCuts feature_values_{0};
 
  public:
   void InitData(DMatrix *p_fmat, RegTree const *p_tree, common::Span<float> hess) {
@@ -86,14 +87,12 @@ class GloablApproxBuilder {
       } else {
         CHECK_EQ(n_total_bins, page.cut.TotalBins());
       }
-      partitioner_.emplace_back(this->ctx_, page.Size(), page.base_rowid,
-                                p_fmat->Info().IsColumnSplit());
+      partitioner_.emplace_back(this->ctx_, page.Size(), page.base_rowid);
       n_batches_++;
     }
 
     histogram_builder_.Reset(ctx_, n_total_bins, p_tree->NumTargets(), BatchSpec(*param_, hess),
-                             collective::IsDistributed(), p_fmat->Info().IsColumnSplit(),
-                             hist_param_);
+                             collective::IsDistributed(), hist_param_);
     monitor_->Stop(__func__);
   }
 
@@ -107,12 +106,12 @@ class GloablApproxBuilder {
     for (auto const &g : gpair) {
       root_sum.Add(g);
     }
-    auto rc = collective::GlobalSum(ctx_, p_fmat->Info(),
-                                    linalg::MakeVec(reinterpret_cast<double *>(&root_sum), 2));
+    auto rc =
+        collective::GlobalSum(ctx_, linalg::MakeVec(reinterpret_cast<double *>(&root_sum), 2));
     collective::SafeColl(rc);
 
     std::vector<CPUExpandEntry> nodes{best};
-    this->histogram_builder_.BuildRootHist(p_fmat, p_tree, partitioner_,
+    this->histogram_builder_.BuildRootHist(p_fmat, p_tree->HostScView(), partitioner_,
                                            linalg::MakeTensorView(ctx_, gpair, gpair.size(), 1),
                                            best, BatchSpec(*param_, hess));
 
@@ -123,19 +122,10 @@ class GloablApproxBuilder {
 
     auto const &histograms = histogram_builder_.Histogram(0);
     auto ft = p_fmat->Info().feature_types.ConstHostSpan();
-    evaluator_.EvaluateSplits(histograms, feature_values_, ft, *p_tree, &nodes);
+    evaluator_.EvaluateSplits(histograms, feature_values_, ft, &nodes);
     monitor_->Stop(__func__);
 
     return nodes.front();
-  }
-
-  void UpdatePredictionCache(DMatrix const *data, linalg::MatrixView<float> out_preds) const {
-    monitor_->Start(__func__);
-    // Caching prediction seems redundant for approx tree method, as sketching takes up
-    // majority of training time.
-    CHECK_EQ(out_preds.Size(), data->Info().num_row_);
-    UpdatePredictionCacheImpl(ctx_, p_last_tree_, partitioner_, out_preds);
-    monitor_->Stop(__func__);
   }
 
   void BuildHistogram(DMatrix *p_fmat, RegTree *p_tree,
@@ -143,7 +133,7 @@ class GloablApproxBuilder {
                       std::vector<GradientPair> const &gpair, common::Span<float> hess) {
     monitor_->Start(__func__);
     this->histogram_builder_.BuildHistLeftRight(
-        ctx_, p_fmat, p_tree, partitioner_, valid_candidates,
+        ctx_, p_fmat, p_tree->HostScView(), partitioner_, valid_candidates,
         linalg::MakeTensorView(ctx_, gpair, gpair.size(), 1), BatchSpec(*param_, hess));
     monitor_->Stop(__func__);
   }
@@ -151,17 +141,16 @@ class GloablApproxBuilder {
   void LeafPartition(RegTree const &tree, common::Span<float const> hess,
                      std::vector<bst_node_t> *p_out_position) {
     monitor_->Start(__func__);
-    if (!task_->UpdateTreeLeaf()) {
-      return;
-    }
+    p_out_position->resize(hess.size());
     for (auto const &part : partitioner_) {
-      part.LeafPartition(ctx_, tree, hess, p_out_position);
+      part.LeafPartition(ctx_, tree.HostScView(), hess,
+                         common::Span{p_out_position->data(), p_out_position->size()});
     }
     monitor_->Stop(__func__);
   }
 
  public:
-  explicit GloablApproxBuilder(TrainParam const *param, HistMakerTrainParam const *hist_param,
+  explicit GlobalApproxBuilder(TrainParam const *param, HistMakerTrainParam const *hist_param,
                                MetaInfo const &info, Context const *ctx,
                                std::shared_ptr<common::ColumnSampler> column_sampler,
                                ObjInfo const *task, common::Monitor *monitor)
@@ -175,6 +164,7 @@ class GloablApproxBuilder {
 
   void UpdateTree(DMatrix *p_fmat, std::vector<GradientPair> const &gpair, common::Span<float> hess,
                   RegTree *p_tree, HostDeviceVector<bst_node_t> *p_out_position) {
+    CHECK(!p_tree->IsMultiTarget()) << "approx" << MTNotImplemented();
     p_last_tree_ = p_tree;
     this->InitData(p_fmat, p_tree, hess);
 
@@ -210,7 +200,7 @@ class GloablApproxBuilder {
       size_t page_id = 0;
       for (auto const &page :
            p_fmat->GetBatches<GHistIndexMatrix>(ctx_, BatchSpec(*param_, hess))) {
-        partitioner_.at(page_id).UpdatePosition(ctx_, page, applied, p_tree);
+        partitioner_.at(page_id).UpdatePosition(ctx_, page, applied, p_tree->HostScView());
         page_id++;
       }
       monitor_->Stop("UpdatePosition");
@@ -229,7 +219,7 @@ class GloablApproxBuilder {
         auto const &histograms = histogram_builder_.Histogram(0);
         auto ft = p_fmat->Info().feature_types.ConstHostSpan();
         monitor_->Start("EvaluateSplits");
-        evaluator_.EvaluateSplits(histograms, feature_values_, ft, *p_tree, &best_splits);
+        evaluator_.EvaluateSplits(histograms, feature_values_, ft, &best_splits);
         monitor_->Stop("EvaluateSplits");
       }
       driver.Push(best_splits.begin(), best_splits.end());
@@ -248,7 +238,7 @@ class GloablApproxBuilder {
 class GlobalApproxUpdater : public TreeUpdater {
   common::Monitor monitor_;
   // specializations for different histogram precision.
-  std::unique_ptr<GloablApproxBuilder> pimpl_;
+  std::unique_ptr<GlobalApproxBuilder> pimpl_;
   // pointer to the last DMatrix, used for update prediction cache.
   DMatrix *cached_{nullptr};
   std::shared_ptr<common::ColumnSampler> column_sampler_;
@@ -257,11 +247,13 @@ class GlobalApproxUpdater : public TreeUpdater {
 
  public:
   explicit GlobalApproxUpdater(Context const *ctx, ObjInfo const *task)
-      : TreeUpdater(ctx), task_{task} {
+      : TreeUpdater(ctx), column_sampler_{std::make_shared<common::ColumnSampler>()}, task_{task} {
     monitor_.Init(__func__);
   }
 
-  void Configure(Args const &args) override { hist_param_.UpdateAllowUnknown(args); }
+  std::set<std::string> Configure(Args const &args) override {
+    return UpdateAndGetUsedParameters(&hist_param_, args);
+  }
   void LoadConfig(Json const &in) override {
     auto const &config = get<Object const>(in);
     FromJson(config.at("hist_train_param"), &hist_param_);
@@ -276,21 +268,19 @@ class GlobalApproxUpdater : public TreeUpdater {
     *sampled = linalg::Empty<GradientPair>(ctx_, gpair->Size(), 1);
     auto in = gpair->HostView().Values();
     std::copy(in.data(), in.data() + in.size(), sampled->HostView().Values().data());
-
-    SampleGradient(ctx_, param, sampled->HostView());
+    cpu_impl::Sampler sampler{param};
+    sampler.Sample(ctx_, sampled->HostView());
   }
 
   [[nodiscard]] char const *Name() const override { return "grow_histmaker"; }
 
-  void Update(TrainParam const *param, linalg::Matrix<GradientPair> *gpair, DMatrix *m,
+  void Update(TrainParam const *param, GradientContainer *in_gpair, DMatrix *m,
               common::Span<HostDeviceVector<bst_node_t>> out_position,
               const std::vector<RegTree *> &trees) override {
     CHECK(hist_param_.GetInitialised());
-    if (!column_sampler_) {
-      column_sampler_ = common::MakeColumnSampler(ctx_);
-    }
-    pimpl_ = std::make_unique<GloablApproxBuilder>(param, &hist_param_, m->Info(), ctx_,
+    pimpl_ = std::make_unique<GlobalApproxBuilder>(param, &hist_param_, m->Info(), ctx_,
                                                    column_sampler_, task_, &monitor_);
+    auto gpair = in_gpair->FullGradOnly();
 
     linalg::Matrix<GradientPair> h_gpair;
     // Obtain the hessian values for weighted sketching
@@ -309,16 +299,6 @@ class GlobalApproxUpdater : public TreeUpdater {
       ++t_idx;
     }
   }
-
-  bool UpdatePredictionCache(const DMatrix *data, linalg::MatrixView<float> out_preds) override {
-    if (data != cached_ || !pimpl_) {
-      return false;
-    }
-    this->pimpl_->UpdatePredictionCache(data, out_preds);
-    return true;
-  }
-
-  [[nodiscard]] bool HasNodePosition() const override { return true; }
 };
 
 DMLC_REGISTRY_FILE_TAG(grow_histmaker);
